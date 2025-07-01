@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "linkurious-entity-resolution.fullname" . }}
+  namespace: "{{ .Release.Namespace }}"
+  labels:
+    {{- include "linkurious-entity-resolution.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "linkurious-entity-resolution.fullname" . }}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "linkurious-entity-resolution.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "linkurious-entity-resolution.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "linkurious-entity-resolution.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.prtag | default .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+          {{- range .Values.linkuriousEntityResolutionConfig }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- if or .Values.env .Values.password  }}
+          env:
+          {{- if .Values.mariadb.enabled }}
+            - name: 'SENZING_DATABASE_VENDOR'
+              value: 'mysql'
+            - name: 'SENZING_DATABASE_HOST'
+              value: {{ include "linkurious-entity-resolution.fullname" . }}-mariadb
+            - name: 'SENZING_DATABASE_PORT'
+              value: '3306'
+            - name: 'SENZING_DATABASE_USER'
+              value: 'root'
+            - name: 'SENZING_DATABASE_PASSWORD'
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linkurious-entity-resolution.fullname" . }}-mariadb
+                  key: mariadb-root-password
+            - name: 'SENZING_DATABASE_NAME'
+              value: {{ .Values.mariadb.auth.database | quote }}
+          {{- end }}
+          {{- if .Values.metrics.enabled }}
+            - name: 'PROMETHEUS_METRICS_ENABLED'
+              value: 'true'
+          {{- end }}
+          {{- if .Values.apiAuth.enabled }}
+            - name: 'LINKURIOUS-ENTITY-RESOLUTION-API-KEY'
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiAuth.existingSecret }}
+                  key: LINKURIOUS_ENTITY_RESOLUTION_API_KEY
+          {{- end }}
+          {{- with .Values.env }}
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          envFrom:
+          {{- with .Values.envFrom }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.existingLicenseSecret }}
+            - secretRef:
+                name: {{ .Values.existingLicenseSecret }}
+          {{- end }}
+          {{- if .Values.database.existingSecret }}
+            - secretRef:
+                name: {{ .Values.database.existingSecret }}
+          {{- end }}
+          volumeMounts:
+            - mountPath: "/config/logs/"
+              name: linkurious-entity-resolution-logs
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path:  {{ tpl .Values.livenessProbe.path . }}
+              port: http
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ tpl .Values.readinessProbe.path . }}
+              port: http
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            successThreshold: {{ .Values.readinessProbe.successThreshold }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: linkurious-entity-resolution-logs
+          configMap:
+            name: "{{ include "linkurious-entity-resolution.fullname" . }}-logs-config"

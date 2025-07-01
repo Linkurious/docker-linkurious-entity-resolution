@@ -1,0 +1,200 @@
+# Default values for linkurious-entity-resolution.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: MY_PRIVATE_REGISTRY/linkurious/linkurious-entity-resolution
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+## Environment variables to pass to linkurious-entity-resolution
+##
+env:
+  - name: 'JAVA_TOOL_OPTIONS'
+    value: '-Xms256m -Xmx256m'
+  - name: 'LOGBACK_OPTIONS'
+    value: '-Dlogback.configurationFile=/config/logs/logback.json.xml'
+## The following set of variables will configure the connection to the database
+    # - name: 'SENZING_DATABASE_VENDOR'
+    #   value: 'mysql'
+    # - name: 'SENZING_DATABASE_HOST'
+    #   value: 'host'
+    # - name: 'SENZING_DATABASE_PORT'
+    #   value: '3306'
+    # - name: 'SENZING_DATABASE_USER'
+    #   value: 'root'
+    # - name: 'SENZING_DATABASE_PASSWORD'
+    #   value: ''
+    # - name: 'SENZING_DATABASE_NAME'
+    #   value: 'linkurious'
+
+## envFrom to pass to server
+##
+envFrom: []
+  # - configMapRef:
+  #     name: config-map-name
+  # - secretRef:
+  #     name: database-secret-name
+  # - secretRef:
+  #     name: linkurious-entity-resolution-api-key
+
+## Provide an existing secret containing the license key
+existingLicenseSecret: ""
+
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: false
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  seccompProfile:
+    type: RuntimeDefault
+  # readOnlyRootFilesystem: true
+
+service:
+  type: ClusterIP
+
+hostPostfix: example.domain
+ingressRoute:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls:
+    secretName: wildcard-default-cert
+    hosts: []
+      # - chart-example.local
+
+linkuriousEntityResolutionConfig: []
+
+## Readiness and liveness probes for default backend
+## Ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-probes/
+##
+readinessProbe:
+  # -- Enable Kubernetes readiness probe for server
+  enabled: true
+  # -- Http path for the readiness probe (templated)
+  path: /status/
+  failureThreshold: 3
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  successThreshold: 1
+  timeoutSeconds: 1
+livenessProbe:
+  # -- Enable Kubernetes liveness probe for server
+  enabled: true
+  # -- Http path for the liveness probe (templated)
+  path: /status/
+  failureThreshold: 3
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  successThreshold: 1
+  timeoutSeconds: 1
+
+resources:
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube.
+  # However in this case the sever as startup ressource usage of ~4.5Gi with an empty load
+  # Settings below give you a starting point for more than a couple of thousand records.
+  limits:
+    cpu: 1000m
+    memory: 7168Mi
+  requests:
+    cpu: 500m
+    memory: 7168Mi
+
+autoscaling:
+  # Server does not support multiple instances for the time being.
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+## Default network policy rules used by all components
+networkPolicies:
+  # -- Create NetworkPolicy objects for all components
+  create: true
+  allowSameNamespaceIngress: true
+  allowAllNamespaceIngress: false
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+## Database configuration
+database:
+  # -- configure the database using an existing secret.
+  # It should contain the following keys:
+  # Non secrets can be passed via a configmap in .Values.envFrom
+  #
+  # We do not recommend using sqlite
+  #
+  # Values given as examples
+  # - SENZING_DATABASE_VENDOR: 'mysql' | 'mariadb'
+  # - SENZING_DATABASE_HOST: '127.0.0.1'
+  # - SENZING_DATABASE_PORT: '3306'
+  # - SENZING_DATABASE_USER: 'linkurious'
+  # - SENZING_DATABASE_PASSWORD: 'linkurious'
+  # - SENZING_DATABASE_NAME: 'linkurious
+  existingSecret: ""
+
+## use secret to enable auth on ER API
+apiAuth:
+  enabled: false
+  existingSecret: "linkurious-entity-resolution-api-key"
+
+metrics:
+## -- Prometheus is disabled by default.
+## -- Deploy metrics service and service monitor
+  enabled: false
+  # -- Entry point used to expose metrics.
+  entryPoint: metrics
+  disableAPICheck: true
+  serviceMonitor:
+    enabled: true
+    namespace: ""
+    additionalLabels:
+      release: kube-prometheus-stack
+    jobLabel: ""
+    interval: 30s
+    honorLabels: true
+mariadb:
+  enabled: false
+
+  auth:
+    database: linkurious
+
+  primary:
+    extraFlags: "--innodb_doublewrite=0 --innodb_file_per_table=1 --innodb_flush_log_at_trx_commit=0 --innodb_flush_neighbors=0"

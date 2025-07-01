@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE configuration>
+
+<configuration scan="true">
+  <import class="ch.qos.logback.classic.jul.LevelChangePropagator"/>
+  <import class="ch.qos.logback.core.ConsoleAppender"/>
+  <import class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder"/>
+
+  <contextListener class="LevelChangePropagator">
+    <resetJUL>true</resetJUL>
+  </contextListener>
+
+  <appender name="STDOUT" class="ConsoleAppender">
+    <encoder class="LoggingEventCompositeJsonEncoder">
+      <providers>
+       <pattern>
+          <omitEmptyFields>true</omitEmptyFields>
+          <pattern>
+            {
+              "timestamp": "%date{yyyy-MM-dd'T'HH:mm:ss.SSSX,UTC}",
+              "level": "%level{toLower}",
+              "name": "%logger",
+              "thread": "%thread",
+              "message": "%message",
+              "error": "%exception"
+            }
+          </pattern>
+        </pattern>
+      </providers>
+    </encoder>
+  </appender>
+
+  <root level="info">
+    <appender-ref ref="STDOUT"/>
+  </root>
+</configuration>

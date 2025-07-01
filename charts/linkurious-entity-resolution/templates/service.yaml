@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "linkurious-entity-resolution.fullname" . }}
+  labels:
+    {{- include "linkurious-entity-resolution.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: 8080
+      targetPort: http
+      protocol: TCP
+      name: http
+    {{- if .Values.metrics.enabled }}
+    - port: 9400
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+  selector:
+    {{- include "linkurious-entity-resolution.selectorLabels" . | nindent 4 }}
