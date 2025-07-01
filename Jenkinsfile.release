@@ -1,0 +1,11 @@
+@Library('linkurious-shared')_
+
+lkeSubReleaseJob {
+  // General
+  projectName = "linkurious/docker-linkurious-entity-resolution"
+
+  releaseType = 'docker'
+
+  runAssetWaiter = true
+
+}
