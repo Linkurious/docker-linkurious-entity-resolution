@@ -39,7 +39,7 @@ spec:
           {{- range .Values.linkuriousEntityResolutionConfig }}
           - {{ . | quote }}
           {{- end }}
-          {{- if or .Values.env .Values.password  }}
+          {{- if or .Values.env .Values.apiAuth.enabled .Values.mariadb.enabled }}
           env:
           {{- if .Values.mariadb.enabled }}
             - name: 'SENZING_DATABASE_VENDOR'
