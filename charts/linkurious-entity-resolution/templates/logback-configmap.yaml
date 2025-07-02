@@ -1,0 +1,11 @@
+# logback.xml as configmap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "{{ include "linkurious-entity-resolution.fullname" . }}-logs-config"
+  namespace: "{{ .Release.Namespace }}"
+  labels:
+    {{- include "linkurious-entity-resolution.labels" . | nindent 4 }}
+data:
+  logback.json.xml: |-
+    {{- .Files.Get "logback.json.xml" | nindent 4 }}
