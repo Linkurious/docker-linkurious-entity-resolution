@@ -58,10 +58,6 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- if (and (.Values.metrics.serviceMonitor).enabled) }}
-      {{- include "linkurious-entity-resolution.metricslabelselector" . | nindent 6 }}
-      {{- else }}
       {{- include "linkurious-entity-resolution.selectorLabels" . | nindent 6 }}
-      {{- end }}
 {{- end }}
 {{- end }}
