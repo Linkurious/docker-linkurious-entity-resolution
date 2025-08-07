@@ -7,5 +7,14 @@
   ],
   "baseBranches": [
     "develop"
+  ],
+  "packageRules": [
+    {
+      "managers": ["helmv3"],
+      "additionalBranchPrefix": "{{baseDir}}-",
+      "commitMessageSuffix": "{{baseDir}}-",
+      "bumpVersion": null,
+      "packagePatterns": [".*"]
+    }
   ]
 }
