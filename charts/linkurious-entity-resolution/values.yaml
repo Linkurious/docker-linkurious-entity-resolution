@@ -192,6 +192,12 @@ metrics:
     honorLabels: true
 mariadb:
   enabled: false
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/mariadb
+  global:
+    security:
+      allowInsecureImages: true
 
   auth:
     database: linkurious
