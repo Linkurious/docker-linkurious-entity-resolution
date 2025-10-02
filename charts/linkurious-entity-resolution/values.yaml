@@ -191,7 +191,7 @@ metrics:
     interval: 30s
     honorLabels: true
 mariadb:
-  enabled: true
+  enabled: false
   image:
     registry: docker.io
     repository: bitnamilegacy/mariadb
