@@ -210,4 +210,3 @@ mariadb:
     image:
       registry: docker.io
       repository: bitnamilegacy/mysqld-exporter
-
