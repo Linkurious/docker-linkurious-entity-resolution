@@ -5,7 +5,20 @@
     "local>Linkurious/renovate-config:meta",
     "customManagers:dockerfileVersions"
   ],
-  "baseBranches": [
+  "baseBranchPatterns": [
     "develop"
+  ],
+  "packageRules": [
+    {
+      "matchManagers": [
+        "helmv3"
+      ],
+      "additionalBranchPrefix": "{{packageFileDir}}-",
+      "commitMessageSuffix": "{{packageFileDir}}-",
+      "bumpVersion": null,
+      "matchPackageNames": [
+        "/.*/"
+      ]
+    }
   ]
 }
