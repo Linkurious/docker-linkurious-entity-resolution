@@ -132,6 +132,15 @@ resources:
     cpu: 500m
     memory: 7168Mi
 
+## Opt-in: make the pod eligible for Kubernetes node swap (NodeSwap, LimitedSwap).
+## Only Burstable pods get swap, so when enabled the memory *request* is lowered to
+## `memoryRequest` while the memory limit from `resources.limits` is kept.
+## Requires nodes with swap enabled and kubelet memorySwap.swapBehavior=LimitedSwap.
+## memoryRequest must be lower than resources.limits.memory.
+nodeSwap:
+  enabled: false
+  memoryRequest: 4608Mi
+
 autoscaling:
   # Server does not support multiple instances for the time being.
   enabled: false
