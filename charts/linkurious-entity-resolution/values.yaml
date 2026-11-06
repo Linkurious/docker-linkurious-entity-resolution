@@ -138,7 +138,7 @@ resources:
 ## Requires nodes with swap enabled and kubelet memorySwap.swapBehavior=LimitedSwap.
 ## memoryRequest must be lower than resources.limits.memory.
 nodeSwap:
-  enabled: false
+  enabled: true
   memoryRequest: 4608Mi
 
 autoscaling:

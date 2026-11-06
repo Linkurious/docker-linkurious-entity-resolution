@@ -89,7 +89,7 @@ helm upgrade --install my-release linkurious-entity-resolution-0.0.6.tgz -f valu
 | networkPolicies.allowAllNamespaceIngress | bool | `false` |  |
 | networkPolicies.allowSameNamespaceIngress | bool | `true` |  |
 | networkPolicies.create | bool | `true` | Create NetworkPolicy objects for all components |
-| nodeSwap.enabled | bool | `false` |  |
+| nodeSwap.enabled | bool | `true` |  |
 | nodeSwap.memoryRequest | string | `"4608Mi"` |  |
 | nodeSelector | object | `{}` |  |
 | podAnnotations | object | `{}` |  |
