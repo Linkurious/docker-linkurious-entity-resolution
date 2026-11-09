@@ -13,9 +13,10 @@ if not k8s_namespace().endswith("dev"):
 
 chart_dir = 'charts/linkurious-entity-resolution'
 workload_name = 'linkurious-entity-resolution'
-release_name = ctx.removesuffix('@k8s-preprod') + '-tilt'
-# fullname helper: <release>-<chart> unless the release already contains the chart name
-fullname = release_name + '-' + workload_name
+# The release name must contain the chart name: the chart reads the DB password from
+# <fullname>-mariadb while the mariadb subchart names its secret <release>-mariadb.
+release_name = ctx.removesuffix('@k8s-preprod') + '-tilt-' + workload_name
+fullname = release_name
 host_postfix = 'k8s.preprod.linkurious.net'
 
 # The chart depends on bitnami/mariadb (charts/*.tgz); fetch it if missing.
