@@ -119,8 +119,14 @@ spec:
             successThreshold: {{ .Values.readinessProbe.successThreshold }}
             failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
           {{- end }}
+          {{- $resources := deepCopy .Values.resources }}
+          {{- if .Values.nodeSwap.enabled }}
+          {{- $requests := default dict $resources.requests }}
+          {{- $_ := set $requests "memory" .Values.nodeSwap.memoryRequest }}
+          {{- $_ := set $resources "requests" $requests }}
+          {{- end }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml $resources | nindent 12 }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
