@@ -39,9 +39,26 @@ spec:
           {{- range .Values.linkuriousEntityResolutionConfig }}
           - {{ . | quote }}
           {{- end }}
-          {{- if or .Values.env .Values.apiAuth.enabled .Values.mariadb.enabled }}
+          {{- if or .Values.env .Values.apiAuth.enabled .Values.mariadb.enabled (include "linkurious-entity-resolution.mariadbOperator.primary" .) }}
           env:
-          {{- if .Values.mariadb.enabled }}
+          {{- if include "linkurious-entity-resolution.mariadbOperator.primary" . }}
+            # MariaDB run by the mariadb-operator, with the user it creates (ALL PRIVILEGES on the database)
+            - name: 'SENZING_DATABASE_VENDOR'
+              value: 'mysql'
+            - name: 'SENZING_DATABASE_HOST'
+              value: {{ include "linkurious-entity-resolution.mariadbOperator.fullname" . }}
+            - name: 'SENZING_DATABASE_PORT'
+              value: '3306'
+            - name: 'SENZING_DATABASE_USER'
+              value: {{ .Values.mariadbOperator.auth.username | quote }}
+            - name: 'SENZING_DATABASE_PASSWORD'
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linkurious-entity-resolution.mariadbOperator.secretName" . }}
+                  key: mariadb-password
+            - name: 'SENZING_DATABASE_NAME'
+              value: {{ .Values.mariadbOperator.auth.database | quote }}
+          {{- else if .Values.mariadb.enabled }}
             - name: 'SENZING_DATABASE_VENDOR'
               value: 'mysql'
             - name: 'SENZING_DATABASE_HOST'

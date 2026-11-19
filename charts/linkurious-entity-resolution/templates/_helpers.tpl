@@ -51,6 +51,51 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Name of the MariaDB run by the mariadb-operator (MariaDB resource, StatefulSet and Service).
+It differs from the Bitnami one ("<fullname>-mariadb") so that both can run side by side during the migration.
+*/}}
+{{- define "linkurious-entity-resolution.mariadbOperator.fullname" -}}
+{{- printf "%s-mariadb-op" (include "linkurious-entity-resolution.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Selector labels of the mariadb-operator MariaDB pods (the operator sets app.kubernetes.io/name=mariadb and
+app.kubernetes.io/instance=<MariaDB name> on them, they are also set explicitly through podMetadata).
+*/}}
+{{- define "linkurious-entity-resolution.selectorLabelsMariadbOperator" -}}
+app.kubernetes.io/name: mariadb
+app.kubernetes.io/instance: {{ include "linkurious-entity-resolution.mariadbOperator.fullname" . }}
+{{- end }}
+
+{{/*
+Common labels of the mariadb-operator resources
+*/}}
+{{- define "linkurious-entity-resolution.labelsMariadbOperator" -}}
+helm.sh/chart: {{ include "linkurious-entity-resolution.chart" . }}
+{{ include "linkurious-entity-resolution.selectorLabelsMariadbOperator" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
+Secret holding the passwords of the mariadb-operator MariaDB (keys mariadb-root-password and mariadb-password)
+*/}}
+{{- define "linkurious-entity-resolution.mariadbOperator.secretName" -}}
+{{- required "mariadbOperator.auth.existingSecret is required" (tpl .Values.mariadbOperator.auth.existingSecret .) }}
+{{- end }}
+
+{{/*
+"true" when linkurious-entity-resolution uses the mariadb-operator MariaDB instead of the Bitnami one
+*/}}
+{{- define "linkurious-entity-resolution.mariadbOperator.primary" -}}
+{{- if and .Values.mariadbOperator.enabled .Values.mariadbOperator.primary -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "linkurious-entity-resolution.serviceAccountName" -}}

@@ -210,3 +210,54 @@ mariadb:
     image:
       registry: docker.io
       repository: bitnamilegacy/mysqld-exporter
+
+## MariaDB run by the mariadb-operator (k8s.mariadb.com/v1alpha1), meant to replace the Bitnami one (`mariadb`).
+## The operator itself is cluster-wide and is not deployed by this chart.
+## Migration steps (scripts/migrate-mariadb-to-operator.sh):
+##   1. enabled: true, primary: false -> an empty database is created next to the Bitnami one
+##   2. the script copies the data from the Bitnami database
+##   3. primary: true -> linkurious-entity-resolution connects to this database
+##   4. once validated, the Bitnami database is disabled (`mariadb.enabled: false`)
+## ref: https://github.com/mariadb-operator/mariadb-operator/blob/main/docs/api_reference.md
+mariadbOperator:
+  # -- Create a MariaDB resource, run by the mariadb-operator
+  enabled: false
+  # -- Connect linkurious-entity-resolution to this database instead of the Bitnami one
+  primary: false
+  # -- MariaDB image. Keep the same version as the Bitnami MariaDB during the migration
+  image: docker.io/mariadb:11.4.6
+  # -- Namespace of the mariadb-operator, allowed to connect to the database
+  operatorNamespace: mariadb-operator
+  auth:
+    # -- Existing secret (templated) with the keys mariadb-root-password and mariadb-password.
+    # The default is the secret of the Bitnami MariaDB. It must not be created by the Bitnami chart
+    # (`mariadb.auth.existingSecret`) for the Bitnami MariaDB to be removable without losing it.
+    existingSecret: '{{ include "linkurious-entity-resolution.fullname" . }}-mariadb'
+    # -- Database created by the operator
+    database: linkurious
+    # -- User created by the operator, with ALL PRIVILEGES on the database (password: mariadb-password),
+    # used by linkurious-entity-resolution once primary is true
+    username: linkurious
+  persistence:
+    # -- Storage class of the data volume (cluster default if empty)
+    storageClass: ""
+    size: 1Gi
+  resources:
+    limits:
+      cpu: 750m
+      memory: 768Mi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  podAnnotations: {}
+  # -- my.cnf content, same settings as the Bitnami MariaDB (mariadb.primary.extraFlags and its defaults)
+  myCnf: |
+    [mariadb]
+    skip-name-resolve
+    character-set-server=utf8mb3
+    collation-server=utf8mb3_general_ci
+    max_allowed_packet=16M
+    innodb_doublewrite=0
+    innodb_file_per_table=1
+    innodb_flush_log_at_trx_commit=0
+    innodb_flush_neighbors=0

@@ -1,0 +1,43 @@
+{{- if .Values.mariadbOperator.enabled }}
+{{- $op := .Values.mariadbOperator }}
+{{- $secret := include "linkurious-entity-resolution.mariadbOperator.secretName" . }}
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: MariaDB
+metadata:
+  # The operator exposes a Service with the same name, used as SENZING_DATABASE_HOST once mariadbOperator.primary is true.
+  name: {{ include "linkurious-entity-resolution.mariadbOperator.fullname" . }}
+  namespace: "{{ .Release.Namespace }}"
+  labels:
+    {{- include "linkurious-entity-resolution.labelsMariadbOperator" . | nindent 4 }}
+spec:
+  image: {{ $op.image }}
+  rootPasswordSecretKeyRef:
+    name: {{ $secret }}
+    key: mariadb-root-password
+    generate: false
+  # Initial database and user (granted ALL PRIVILEGES on the database by the operator)
+  database: {{ $op.auth.database }}
+  username: {{ $op.auth.username }}
+  passwordSecretKeyRef:
+    name: {{ $secret }}
+    key: mariadb-password
+    generate: false
+  storage:
+    size: {{ $op.persistence.size }}
+    {{- with $op.persistence.storageClass }}
+    storageClassName: {{ . }}
+    {{- end }}
+  {{- with $op.myCnf }}
+  myCnf: |
+    {{- . | trim | nindent 4 }}
+  {{- end }}
+  resources:
+    {{- toYaml $op.resources | nindent 4 }}
+  podMetadata:
+    labels:
+      {{- include "linkurious-entity-resolution.selectorLabelsMariadbOperator" . | nindent 6 }}
+    {{- with $op.podAnnotations }}
+    annotations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}

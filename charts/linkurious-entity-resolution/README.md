@@ -1,6 +1,6 @@
 # linkurious-entity-resolution
 
-![Version: 0.0.6](https://img.shields.io/badge/Version-0.0.6-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 1.0.1](https://img.shields.io/badge/AppVersion-1.0.1-informational?style=flat-square)
+![Version: 0.0.16](https://img.shields.io/badge/Version-0.0.16-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 1.2.3](https://img.shields.io/badge/AppVersion-1.2.3-informational?style=flat-square)
 
 A Helm chart for linkurious-entity-resolution on Kubernetes
 
@@ -24,7 +24,7 @@ helm package charts/linkurious-entity-resolution
 To install linkurious-entity-resolution server, please create a `values.yaml` file, setting your private registry and then run:
 
 ```console
-helm upgrade --install my-release linkurious-entity-resolution-0.0.6.tgz -f values.yaml
+helm upgrade --install my-release linkurious-entity-resolution-0.0.16.tgz -f values.yaml
 ```
 > [!CAUTION]
 > Do not use linkurious-entity-resolution as release name as it will create conflicting configurations.
@@ -76,6 +76,28 @@ helm upgrade --install my-release linkurious-entity-resolution-0.0.6.tgz -f valu
 | livenessProbe.timeoutSeconds | int | `1` |  |
 | mariadb.auth.database | string | `"linkurious"` |  |
 | mariadb.enabled | bool | `false` |  |
+| mariadb.global.security.allowInsecureImages | bool | `true` |  |
+| mariadb.image.registry | string | `"docker.io"` |  |
+| mariadb.image.repository | string | `"bitnamilegacy/mariadb"` |  |
+| mariadb.metrics.enabled | bool | `false` |  |
+| mariadb.metrics.image.registry | string | `"docker.io"` |  |
+| mariadb.metrics.image.repository | string | `"bitnamilegacy/mysqld-exporter"` |  |
+| mariadb.primary.extraFlags | string | `"--innodb_doublewrite=0 --innodb_file_per_table=1 --innodb_flush_log_at_trx_commit=0 --innodb_flush_neighbors=0"` |  |
+| mariadbOperator.auth.database | string | `"linkurious"` | Database created by the operator |
+| mariadbOperator.auth.existingSecret | string | `"{{ include \"linkurious-entity-resolution.fullname\" . }}-mariadb"` | Existing secret (templated) with the keys mariadb-root-password and mariadb-password. The default is the secret of the Bitnami MariaDB. It must not be created by the Bitnami chart (`mariadb.auth.existingSecret`) for the Bitnami MariaDB to be removable without losing it. |
+| mariadbOperator.auth.username | string | `"linkurious"` | User created by the operator, with ALL PRIVILEGES on the database (password: mariadb-password), used by linkurious-entity-resolution once primary is true |
+| mariadbOperator.enabled | bool | `false` | Create a MariaDB resource, run by the mariadb-operator |
+| mariadbOperator.image | string | `"docker.io/mariadb:11.4.6"` | MariaDB image. Keep the same version as the Bitnami MariaDB during the migration |
+| mariadbOperator.myCnf | string | `"[mariadb]\nskip-name-resolve\ncharacter-set-server=utf8mb3\ncollation-server=utf8mb3_general_ci\nmax_allowed_packet=16M\ninnodb_doublewrite=0\ninnodb_file_per_table=1\ninnodb_flush_log_at_trx_commit=0\ninnodb_flush_neighbors=0\n"` | my.cnf content, same settings as the Bitnami MariaDB (mariadb.primary.extraFlags and its defaults) |
+| mariadbOperator.operatorNamespace | string | `"mariadb-operator"` | Namespace of the mariadb-operator, allowed to connect to the database |
+| mariadbOperator.persistence.size | string | `"1Gi"` |  |
+| mariadbOperator.persistence.storageClass | string | `""` | Storage class of the data volume (cluster default if empty) |
+| mariadbOperator.podAnnotations | object | `{}` |  |
+| mariadbOperator.primary | bool | `false` | Connect linkurious-entity-resolution to this database instead of the Bitnami one |
+| mariadbOperator.resources.limits.cpu | string | `"750m"` |  |
+| mariadbOperator.resources.limits.memory | string | `"768Mi"` |  |
+| mariadbOperator.resources.requests.cpu | string | `"500m"` |  |
+| mariadbOperator.resources.requests.memory | string | `"512Mi"` |  |
 | metrics.disableAPICheck | bool | `true` |  |
 | metrics.enabled | bool | `false` |  |
 | metrics.entryPoint | string | `"metrics"` | Entry point used to expose metrics. |
