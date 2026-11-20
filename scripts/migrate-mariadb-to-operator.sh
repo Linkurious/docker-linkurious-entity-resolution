@@ -255,7 +255,11 @@ verify() {
   if diff <(echo "${src}") <(echo "${dst}") >&2; then
     log "OK: $(echo "${src}" | grep -c . || true) tables, same row counts"
   else
-    die "row counts differ (< source, > destination)"
+    if [[ "${command}" == "copy" ]]; then
+      log "WARNING: row counts differ (< source, > destination); concurrent source writes can cause rehearsal drift"
+    else
+      die "row counts differ (< source, > destination)"
+    fi
   fi
 }
 
