@@ -128,6 +128,9 @@ cleanup() {
       ${fenced} || fence_destination
     fi
   fi
+  if [[ "${phase}" != "switch" ]] && ${fenced}; then
+    keep_fenced=true
+  fi
   unfence_destination
   release_source
   exit "${rc}"
