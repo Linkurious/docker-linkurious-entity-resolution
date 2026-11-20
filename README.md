@@ -31,8 +31,10 @@ until the new one is validated:
        existingSecret: my-mariadb-secret
    ```
    In k8s-dev, this secret is a SealedSecret (`<release>-mariadb` in preprod).
-1. `mariadbOperator.enabled: true`, `primary: false`: an empty database is created next to the Bitnami one, with
-   the same secret. Entity-resolution still uses the Bitnami database.
+1. Before creating the destination, measure the source database's data and indexes and set
+   `mariadbOperator.persistence.size` with room for MariaDB overhead and growth (the default is only `1Gi`).
+   Then set `mariadbOperator.enabled: true`, `primary: false`: an empty database is created next to the Bitnami one,
+   with the same secret. Entity-resolution still uses the Bitnami database.
 2. Rehearsal (optional): copy the data while entity-resolution keeps running, and compare row counts (differences
    are only reported, entity-resolution keeps writing):
    ```sh
