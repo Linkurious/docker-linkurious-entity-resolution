@@ -5,8 +5,9 @@
 # The dump is streamed from one pod to the other (kubectl exec | kubectl exec): no data is written locally.
 # Only the application database is copied: users and grants of the destination are managed by the operator.
 #
-# Usage: scripts/migrate-mariadb-to-operator.sh [-n namespace] [-r release] [-d database] [-t minutes] [-y] <command>
-#   check    show both databases (version, tables, row counts, users), changes nothing
+# Usage: scripts/migrate-mariadb-to-operator.sh [-n namespace] [-r release] [-m mariadb] [-d database] [-t minutes] [-y] <command>
+#   -m       name of the MariaDB resource (default: <release truncated to 52 chars>-mariadb-op, as in the chart)
+#   check    show both databases (version, tables, row counts, users, pods), changes nothing
 #   copy     rehearsal: copy the data while entity-resolution keeps writing to the Bitnami database
 #            (consistent snapshot, but writes made after it are not copied), then compare row counts
 #   cutover  block the writes on the Bitnami database (global read lock), copy the data, compare row counts, then
@@ -18,7 +19,9 @@
 # Entity-resolution connects to the Bitnami database as root, so `read_only` would not block its writes:
 # FLUSH TABLES WITH READ LOCK does, and it is released as soon as the session holding it ends.
 # The destination database is dropped and recreated by copy and cutover. To avoid erasing data written by
-# entity-resolution, both refuse to run once it is configured to use the destination database.
+# entity-resolution, both refuse to run unless the statefulset rollout to the Bitnami database is complete,
+# every running pod uses it and no application session is open on the destination. During the copy, the
+# application user of the destination is locked (ACCOUNT LOCK), so that a pod switched meanwhile cannot write to it.
 set -euo pipefail
 
 namespace="linkurious-entity-resolution-preprod"
@@ -27,12 +30,17 @@ database="linkurious"
 wait_minutes=30
 assume_yes=false
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+dst_name=""
+app_user=""
+sts_state=""
 
-while getopts "n:r:d:t:yh" opt; do
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+while getopts "n:r:m:d:t:yh" opt; do
   case "${opt}" in
     n) namespace="${OPTARG}" ;;
     r) release="${OPTARG}" ;;
+    m) dst_name="${OPTARG}" ;;
     d) database="${OPTARG}" ;;
     t) wait_minutes="${OPTARG}" ;;
     y) assume_yes=true ;;
@@ -45,7 +53,11 @@ command="$1"
 [[ "${wait_minutes}" =~ ^[0-9]+$ ]] || { echo "ERROR: -t expects a number of minutes" >&2; exit 1; }
 
 src_pod="${release}-mariadb-0"
-dst_name="${release}-mariadb-op"
+if [[ -z "${dst_name}" ]]; then
+  # Same as linkurious-entity-resolution.mariadbOperator.fullname (fullname = release when it contains the chart name)
+  dst_name="${release:0:52}"
+  dst_name="${dst_name%%-}-mariadb-op"
+fi
 dst_pod="${dst_name}-0"
 er_sts="${release}"
 er_container="linkurious-entity-resolution"
@@ -87,14 +99,116 @@ preflight() {
     || die "MariaDB ${dst_name} is not Ready (kubectl -n ${namespace} describe mariadb ${dst_name})"
   log "source version: $(sql "${src_pod}" 'SELECT VERSION()')"
   log "destination version: $(sql "${dst_pod}" 'SELECT VERSION()')"
+  app_user="$(kubectl -n "${namespace}" get "mariadb/${dst_name}" -o jsonpath='{.spec.username}')"
+  [[ -n "${app_user}" ]] || die "MariaDB ${dst_name} has no spec.username"
+  log "application user on the destination: ${app_user}"
 }
 
+cleanup() {
+  unfence_destination
+  release_source
+}
+
+# Pods of the entity-resolution statefulset, one per line: name|controller-revision-hash|SENZING_DATABASE_HOST|deletionTimestamp
+er_pods() {
+  local selector
+  # shellcheck disable=SC2016
+  selector="$(kubectl -n "${namespace}" get statefulset "${er_sts}" \
+    -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}')"
+  kubectl -n "${namespace}" get pods -l "${selector%,}" -o jsonpath="{range .items[*]}{.metadata.name}{\"|\"}{.metadata.labels.controller-revision-hash}{\"|\"}{.spec.containers[?(@.name==\"${er_container}\")].env[?(@.name==\"SENZING_DATABASE_HOST\")].value}{\"|\"}{.metadata.deletionTimestamp}{\"\\n\"}{end}"
+}
+
+# Snapshot of the statefulset: generation|observedGeneration|replicas|readyReplicas|updatedReplicas|currentRevision|updateRevision
+er_sts_state() {
+  kubectl -n "${namespace}" get statefulset "${er_sts}" -o jsonpath='{.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.readyReplicas}|{.status.updatedReplicas}|{.status.currentRevision}|{.status.updateRevision}'
+}
+
+# Application sessions open on the destination: user of the MariaDB resource, or any client on the database,
+# except our own sessions (unix socket, localhost)
+dst_app_sessions() {
+  sql "${dst_pod}" "SELECT CONCAT(id, ' ', user, '@', host, ' ', IFNULL(db, '-')) FROM information_schema.processlist WHERE (user = '${app_user}' OR db = '${database}') AND host NOT LIKE 'localhost%' AND command <> 'Killed' AND id <> CONNECTION_ID()"
+}
+
+# Fails unless entity-resolution is fully rolled out on the Bitnami database: desired template, statefulset
+# status, and every running pod. Also fails if an application session is open on the destination.
 ensure_destination_unused() {
-  local host
+  local host state gen observed replicas ready updated current update pods sessions name revision pod_host deleting bad=""
   host="$(er_db_host)"
-  log "entity-resolution SENZING_DATABASE_HOST: ${host:-<unset>}"
+  log "entity-resolution SENZING_DATABASE_HOST (template): ${host:-<unset>}"
   [[ "${host}" != "${dst_name}" ]] \
-    || die "entity-resolution already uses ${dst_name}: refusing to drop its database (set mariadbOperator.primary=false first)"
+    || die "entity-resolution is configured to use ${dst_name}: refusing to drop its database (set mariadbOperator.primary=false first)"
+
+  state="$(er_sts_state)"
+  IFS='|' read -r gen observed replicas ready updated current update <<< "${state}"
+  log "statefulset ${er_sts}: generation ${gen} (observed ${observed}), ready ${ready:-0}/${replicas}, updated ${updated:-0}/${replicas}, revision ${current} -> ${update}"
+  [[ "${gen}" == "${observed}" && "${current}" == "${update}" && "${updated:-0}" == "${replicas}" && "${ready:-0}" == "${replicas}" ]] \
+    || die "statefulset ${er_sts} rollout is not complete (kubectl -n ${namespace} rollout status statefulset/${er_sts})"
+
+  pods="$(er_pods)"
+  [[ "$(grep -c . <<< "${pods}" || true)" == "${replicas}" ]] || bad+=$'\n'"  expected ${replicas} pod(s)"
+  while IFS='|' read -r name revision pod_host deleting; do
+    [[ -n "${name}" ]] || continue
+    log "pod ${name}: revision ${revision}, SENZING_DATABASE_HOST ${pod_host:-<unset>}${deleting:+, terminating}"
+    [[ "${revision}" == "${update}" ]] || bad+=$'\n'"  ${name} runs revision ${revision}, not ${update}"
+    [[ "${pod_host}" != "${dst_name}" ]] || bad+=$'\n'"  ${name} uses ${dst_name}"
+    [[ -z "${deleting}" ]] || bad+=$'\n'"  ${name} is terminating"
+  done <<< "${pods}"
+  [[ -z "${bad}" ]] || die "entity-resolution pods are not all on the Bitnami database:${bad}"
+
+  sessions="$(dst_app_sessions)"
+  [[ -z "${sessions}" ]] || die "application sessions are open on ${dst_pod}, refusing to drop its database:"$'\n'"${sessions}"
+  sts_state="${state}"
+}
+
+# Hosts of the application user on the destination
+app_user_hosts() {
+  sql "${dst_pod}" "SELECT host FROM mysql.user WHERE user = '${app_user}'"
+}
+
+# Locks the application user of the destination and kills its sessions: until unfence_destination, a pod switched
+# to the destination (Argo CD sync during the copy) cannot connect, so the drop/copy cannot erase its writes.
+fenced=false
+keep_fenced=false
+fence_destination() {
+  local hosts h ids
+  hosts="$(app_user_hosts)"
+  [[ -n "${hosts}" ]] || die "user ${app_user} not found on ${dst_pod}"
+  log "locking user ${app_user} on ${dst_pod} during the copy"
+  fenced=true
+  for h in ${hosts}; do
+    sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT LOCK"
+  done
+  ids="$(sql "${dst_pod}" "SELECT id FROM information_schema.processlist WHERE user = '${app_user}' AND id <> CONNECTION_ID()")"
+  for id in ${ids}; do
+    sql "${dst_pod}" "KILL ${id}" 2>/dev/null || true
+  done
+}
+
+# Checks that the destination stayed fenced and that entity-resolution did not change during the copy
+ensure_fence_held() {
+  local h
+  for h in $(app_user_hosts); do
+    sql "${dst_pod}" "SHOW CREATE USER '${app_user}'@'${h}'" | grep -q 'ACCOUNT LOCK' \
+      || { keep_fenced=true; die "user ${app_user}@${h} was unlocked during the copy (operator reconcile?): the copy may not be consistent"; }
+  done
+  if [[ "$(er_sts_state)" != "${sts_state}" || "$(er_db_host)" == "${dst_name}" ]]; then
+    keep_fenced=true
+    die "statefulset ${er_sts} changed during the copy (switch or rollback in progress): ${app_user} stays locked on ${dst_pod}. Check which database entity-resolution must use, then unlock it with: ALTER USER '${app_user}'@'%' ACCOUNT UNLOCK"
+  fi
+}
+
+unfence_destination() {
+  local h
+  ${fenced} || return 0
+  if ${keep_fenced}; then
+    log "user ${app_user} left locked on ${dst_pod}"
+    return 0
+  fi
+  for h in $(app_user_hosts); do
+    sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT UNLOCK" || true
+  done
+  fenced=false
+  log "user ${app_user} unlocked on ${dst_pod}"
 }
 
 # Exact row count of every table of the database, sorted ("table<TAB>count")
@@ -206,7 +320,10 @@ EOF
 case "${command}" in
   check)
     preflight
-    log "entity-resolution SENZING_DATABASE_HOST: $(er_db_host)"
+    log "entity-resolution SENZING_DATABASE_HOST (template): $(er_db_host)"
+    log "statefulset ${er_sts} (generation|observed|replicas|ready|updated|currentRevision|updateRevision): $(er_sts_state)"
+    log "pods (name|revision|SENZING_DATABASE_HOST|deletionTimestamp):"; er_pods >&2
+    log "application sessions on the destination: $(dst_app_sessions | grep -c . || true)"
     log "source row counts:";      row_counts "${src_pod}"
     log "destination row counts:"; row_counts "${dst_pod}"
     # Users are not copied: any user needed on the destination has to be declared as a User/Grant resource
@@ -218,19 +335,31 @@ case "${command}" in
     preflight
     ensure_destination_unused
     confirm "Drop ${database} on ${dst_pod} and copy it from ${src_pod} (rehearsal, entity-resolution keeps running)?"
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+    fence_destination
+    # Checked again once fenced: a switch started between the first check and the lock is caught here
+    ensure_destination_unused
     copy_data
     verify
+    ensure_fence_held
+    unfence_destination
     log "rehearsal done: writes made after the dump are not copied, run 'cutover' for the final copy"
     ;;
   cutover)
     preflight
     ensure_destination_unused
     confirm "Lock ${src_pod} (entity-resolution writes hang until the switch, ${wait_minutes} min max), drop ${database} on ${dst_pod} and copy it?"
-    trap release_source EXIT
+    trap cleanup EXIT
     trap 'exit 130' INT TERM
+    fence_destination
+    ensure_destination_unused
     lock_source
     copy_data
     verify
+    ensure_fence_held
+    # The destination is ready: from now on, entity-resolution can be switched to it
+    unfence_destination
     wait_for_switch
     kill_source_clients
     release_source
