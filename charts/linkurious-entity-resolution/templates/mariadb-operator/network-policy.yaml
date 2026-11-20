@@ -1,4 +1,4 @@
-{{- if .Values.mariadbOperator.enabled }}
+{{- if and .Values.mariadbOperator.enabled .Values.networkPolicies.create }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
