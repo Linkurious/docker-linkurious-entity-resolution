@@ -12,11 +12,14 @@
 #            (consistent snapshot, but writes made after it are not copied), then compare row counts
 #   cutover  block the writes on the Bitnami database (global read lock), copy the data, compare row counts, then
 #            wait for entity-resolution to be restarted on the new database (mariadbOperator.primary=true synced
-#            by Argo CD), and release the lock. -t (default 30) is the maximum time the lock is held, copy included.
-#            Entity-resolution writes hang while the lock is held. If the time runs out or the script is
-#            interrupted, the lock is released and entity-resolution keeps using the Bitnami database.
-#            If the lock session disappears (source pod restart, killed session, kubectl exec cut), the cutover
-#            is aborted and the destination user stays locked, so that no pod uses a copy missing later writes.
+#            by Argo CD), and release the lock. Entity-resolution writes hang while the lock is held.
+#            -t (default 30): time, copy included, for the switch to begin. If it runs out, the lock is lost or the
+#            script is interrupted before the switch begins, the lock is released, entity-resolution keeps using
+#            the Bitnami database and the destination user stays locked (the copy is stale).
+#            Once Argo CD has started to change the statefulset, the lock is kept (and renewed, or taken again if
+#            lost) whatever happens, until every pod runs on the new database, or until every pod is back on the
+#            Bitnami one (mariadbOperator.primary reverted) and the rollback is confirmed ('rollback', or -y).
+#            Ctrl-C then offers to release the lock anyway (type 'release'), at the risk of splitting the writes.
 #
 # Entity-resolution connects to the Bitnami database as root, so `read_only` would not block its writes:
 # FLUSH TABLES WITH READ LOCK does, and it is released as soon as the session holding it ends.
@@ -35,8 +38,9 @@ assume_yes=false
 dst_name=""
 app_user=""
 sts_state=""
+src_host=""
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 while getopts "n:r:m:d:t:yh" opt; do
   case "${opt}" in
@@ -106,9 +110,27 @@ preflight() {
   log "application user on the destination: ${app_user}"
 }
 
+# phase "switch": the destination has been unlocked for entity-resolution, during the cutover
+phase=""
 cleanup() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  if [[ "${phase}" == "switch" && -z "${switch_state}" ]]; then
+    if switch_begun; then
+      # Timeout, interrupt or error while pods may be moving to the destination: releasing the lock now would let
+      # the previous pods (or their statements waiting for it) write on Bitnami while the new ones use the copy
+      log "exiting (status ${rc}) while ${er_sts} is switching: the lock is kept until the switch is resolved"
+      hold_switch
+    else
+      # Nothing switched yet, but the copy becomes stale once the source is writable again
+      keep_fenced=true
+      ${fenced} || fence_destination
+    fi
+  fi
   unfence_destination
   release_source
+  exit "${rc}"
 }
 
 # Pods of the entity-resolution statefulset, one per line: name|controller-revision-hash|SENZING_DATABASE_HOST|deletionTimestamp
@@ -160,6 +182,7 @@ ensure_destination_unused() {
   sessions="$(dst_app_sessions)"
   [[ -z "${sessions}" ]] || die "application sessions are open on ${dst_pod}, refusing to drop its database:"$'\n'"${sessions}"
   sts_state="${state}"
+  src_host="${host}"
 }
 
 # Hosts of the application user on the destination
@@ -255,54 +278,72 @@ copy_data() {
   log "grants on destination: $(sql "${dst_pod}" "SELECT CONCAT(grantee, ' ', privilege_type) FROM information_schema.schema_privileges WHERE table_schema='${database}'" | sort -u | tr '\n' ' ')"
 }
 
-# Id of the source session holding the global read lock (empty if none)
-lock_session_id() {
+# Ids of the source sessions holding the global read lock, one per line (empty if none)
+lock_session_ids() {
   sql "${src_pod}" "SELECT id FROM information_schema.processlist WHERE info LIKE CONCAT('%', 'er-migration', '-lock', '%') AND id <> CONNECTION_ID()"
 }
 
 lock_pid=""
 lock_id=""
-# Time (epoch) by which the cutover must be done, set when the lock is taken. The lock session sleeps
-# lock_margin seconds longer, so it outlives every step of the script; it only expires on its own if the script
-# dies without releasing it (kill -9, lost laptop...), which bounds how long the source can stay locked.
+# Time (epoch) by which entity-resolution must start switching, set when the lock is taken. Until the switch
+# begins, the lock session sleeps lock_margin seconds longer than that; once it has begun, the lock is renewed
+# until the switch or a rollback is complete. A session only expires on its own if the script dies without
+# releasing it (kill -9, lost laptop...), which bounds how long the source can stay locked.
 lock_deadline=0
+lock_expires=0
 lock_margin=600
-lock_source() {
-  local id=""
-  log "taking the global read lock on ${src_pod} (entity-resolution writes hang from now on, ${wait_minutes} min max)"
+lock_renew_seconds=1800
+
+# take_lock <seconds>: starts a session that takes the global read lock and sleeps <seconds>, waits for it to hold
+# the lock, and makes it the current lock session. A previous lock session is left untouched (the global read
+# lock can be held by several sessions at once), so that the lock can be renewed without a gap.
+take_lock() {
+  local seconds="$1" pid id=""
   # The session stays open (SLEEP) to keep the lock; it is killed by release_source.
   # SLEEP starts once FLUSH TABLES WITH READ LOCK returns, i.e. after the lock is taken.
   # shellcheck disable=SC2016
   kubectl -n "${namespace}" exec "${src_pod}" -c mariadb -- sh -c \
     "${remote_auth}"' exec "$(command -v mariadb || command -v mysql)" -uroot -N -B -e "$1"' sh \
-    "FLUSH TABLES WITH READ LOCK; SELECT '${lock_marker}', SLEEP($(( wait_minutes * 60 + lock_margin )))" >/dev/null &
-  lock_pid=$!
+    "FLUSH TABLES WITH READ LOCK; SELECT '${lock_marker}', SLEEP(${seconds})" >/dev/null &
+  pid=$!
   for _ in $(seq 1 60); do
-    id="$(lock_session_id)"
+    id="$(lock_session_ids | grep -vx "${lock_id:-none}" | head -1 || true)"
     [[ -n "${id}" ]] && break
-    kill -0 "${lock_pid}" 2>/dev/null || die "the session taking the lock ended"
+    kill -0 "${pid}" 2>/dev/null || return 1
     sleep 1
   done
-  [[ -n "${id}" ]] || die "could not take the global read lock in 60s (long running query on ${src_pod}?)"
+  [[ -n "${id}" ]] || { kill "${pid}" 2>/dev/null || true; return 1; }
+  lock_pid="${pid}"
   lock_id="${id}"
-  lock_deadline=$(( $(date +%s) + wait_minutes * 60 ))
-  log "global read lock held by session ${lock_id}, until $(date -r "${lock_deadline}" +%H:%M:%S 2>/dev/null || date -d "@${lock_deadline}" +%H:%M:%S)"
+  lock_expires=$(( $(date +%s) + seconds ))
 }
 
-# True while the lock is held: the local kubectl exec is alive and the same session is still sleeping on the
-# source. A failed check is retried, so that a transient API error does not abort the cutover.
+lock_source() {
+  log "taking the global read lock on ${src_pod} (entity-resolution writes hang from now on, ${wait_minutes} min max before the switch)"
+  take_lock $(( wait_minutes * 60 + lock_margin )) \
+    || die "could not take the global read lock in 60s (long running query on ${src_pod}?)"
+  lock_deadline=$(( $(date +%s) + wait_minutes * 60 ))
+  log "global read lock held by session ${lock_id}, the switch must begin before $(fmt_time "${lock_deadline}")"
+}
+
+fmt_time() { date -r "$1" +%H:%M:%S 2>/dev/null || date -d "@$1" +%H:%M:%S; }
+
+# True while the lock is held: the local kubectl exec is alive and its session is still sleeping on the source.
+# A failed check is retried, so that a transient API error is not taken for a lost lock.
 lock_held() {
   local _try
+  [[ -n "${lock_pid}" ]] || return 1
   for _try in 1 2 3; do
     kill -0 "${lock_pid}" 2>/dev/null || return 1
-    [[ "$(lock_session_id 2>/dev/null || true)" == "${lock_id}" ]] && return 0
+    lock_session_ids 2>/dev/null | grep -qx "${lock_id}" && return 0
     sleep 2
   done
   return 1
 }
 
-# Aborts the cutover if the lock is lost or about to expire. Writes may have resumed on the source after the
-# dump: the destination user is (re)locked and left locked, so that no pod switched to the copy can use it.
+# Aborts the cutover, before entity-resolution is switched, if the lock is lost or the time is out. Writes may
+# have resumed on the source after the dump: the destination user is (re)locked and left locked, so that no pod
+# switched to the copy can use it.
 ensure_lock_held() {
   local step="$1"
   if ! lock_held; then
@@ -320,14 +361,41 @@ ensure_lock_held() {
   fi
 }
 
+# During a switch: renews the lock before it expires, and takes it again if it was lost
+lock_lost_during_switch=false
+keep_lock_alive() {
+  local old_pid old_id
+  if ! lock_held; then
+    lock_lost_during_switch=true
+    log "WARNING: global read lock lost on ${src_pod} during the switch, taking it again (writes may have reached it meanwhile)"
+    lock_pid=""; lock_id=""
+    if take_lock "${lock_renew_seconds}"; then
+      log "global read lock taken again by session ${lock_id}"
+    else
+      log "WARNING: could not take the lock again, retrying"
+    fi
+    return 0
+  fi
+  if (( $(date +%s) > lock_expires - 300 )); then
+    old_pid="${lock_pid}"; old_id="${lock_id}"
+    if take_lock "${lock_renew_seconds}"; then
+      sql "${src_pod}" "KILL ${old_id}" 2>/dev/null || true
+      kill "${old_pid}" 2>/dev/null || true
+      log "global read lock renewed by session ${lock_id} (until $(fmt_time "${lock_expires}"))"
+    else
+      lock_pid="${old_pid}"; lock_id="${old_id}"
+      log "WARNING: could not renew the lock, session ${old_id} expires at $(fmt_time "${lock_expires}"), retrying"
+    fi
+  fi
+}
+
 release_source() {
   local id
   [[ -n "${lock_pid}" ]] || return 0
-  id="$(lock_session_id || true)"
-  if [[ -n "${id}" ]]; then
+  for id in $(lock_session_ids || true); do
     sql "${src_pod}" "KILL ${id}" || true
-    log "global read lock released on ${src_pod}"
-  fi
+  done
+  log "global read lock released on ${src_pod}"
   kill "${lock_pid}" 2>/dev/null || true
   lock_pid=""
   lock_id=""
@@ -344,31 +412,108 @@ kill_source_clients() {
   log "killed $(echo "${ids}" | grep -c . || true) client connection(s) left on ${src_pod}"
 }
 
-# Waits, until lock_deadline, for the statefulset to point to the destination and be rolled out, checking the
-# lock at every step
+# rolled_out_on <host>: true when the template, the statefulset status and every running pod use <host>
+rolled_out_on() {
+  local want="$1" state gen observed replicas ready updated current update pods name revision pod_host deleting n=0
+  [[ -n "${want}" && "$(er_db_host)" == "${want}" ]] || return 1
+  state="$(er_sts_state)" || return 1
+  IFS='|' read -r gen observed replicas ready updated current update <<< "${state}"
+  [[ "${gen}" == "${observed}" && "${current}" == "${update}" && "${updated:-0}" == "${replicas}" && "${ready:-0}" == "${replicas}" ]] || return 1
+  pods="$(er_pods)" || return 1
+  while IFS='|' read -r name revision pod_host deleting; do
+    [[ -n "${name}" ]] || continue
+    [[ "${revision}" == "${update}" && "${pod_host}" == "${want}" && -z "${deleting}" ]] || return 1
+    n=$(( n + 1 ))
+  done <<< "${pods}"
+  (( n == replicas ))
+}
+
+# True once Argo CD has started to change the statefulset since the copy (or if it cannot be told): from then on,
+# pods may be moving to the destination and the source must stay locked until the switch is resolved.
+switch_begun() {
+  local host gen
+  host="$(er_db_host 2>/dev/null)" || return 0
+  gen="$(kubectl -n "${namespace}" get statefulset "${er_sts}" -o jsonpath='{.metadata.generation}' 2>/dev/null)" || return 0
+  [[ "${host}" == "${dst_name}" || "${gen}" != "${sts_state%%|*}" ]]
+}
+
+# Interactive answer, never assumed: no terminal means no
+ask_tty() {
+  local answer
+  [[ -r /dev/tty ]] || return 1
+  read -r -p "$1 " answer </dev/tty || return 1
+  [[ "${answer}" == "$2" ]]
+}
+
+# switch_state: "" (not resolved), "done" (all pods on the destination), "rolled_back" (all pods back on the source)
+switch_state=""
+hold_interrupted=false
+
+finish_switch() {
+  # The previous pods are gone: their statements still waiting for the lock must not run once it is released
+  kill_source_clients
+  switch_state="done"
+  log "rollout of ${er_sts} on ${dst_name} done"
+  if ${lock_lost_during_switch}; then
+    log "WARNING: the lock was lost for a while during the switch: writes may have reached ${src_pod} after the
+    copy. Compare both databases ('check') before removing it."
+  fi
+}
+
+# Once the switch has begun, keeps the source locked (renewing the lock) until every pod runs on the destination,
+# or until a rollback to the source is complete and confirmed. Interrupts and timeouts do not release the lock.
+hold_switch() {
+  set +e
+  trap 'hold_interrupted=true' INT TERM
+  log "switch in progress: ${src_pod} stays locked until ${er_sts} is rolled out on ${dst_name},"
+  log "or rolled back on ${src_host} (revert mariadbOperator.primary) and confirmed. Ctrl-C shows the options."
+  while :; do
+    keep_lock_alive
+    if rolled_out_on "${dst_name}"; then
+      finish_switch
+      break
+    fi
+    if rolled_out_on "${src_host}"; then
+      log "rollback done: every pod of ${er_sts} uses ${src_host} again"
+      if ${assume_yes} || ask_tty "Release the lock on ${src_pod}? Writes made on ${dst_name} since the switch are not on Bitnami. Type 'rollback' to confirm:" rollback; then
+        # The copy is now stale: no pod may use it until a new cutover
+        keep_fenced=true
+        fence_destination
+        switch_state="rolled_back"
+        break
+      fi
+    fi
+    if ${hold_interrupted}; then
+      hold_interrupted=false
+      log "statefulset ${er_sts}: $(er_sts_state), template SENZING_DATABASE_HOST: $(er_db_host)"
+      er_pods >&2
+      if ask_tty "Release the lock anyway? Pods on Bitnami and on ${dst_name} may then split the writes. Type 'release' to confirm:" release; then
+        log "WARNING: lock released during the switch on request"
+        switch_state="released"
+        break
+      fi
+      log "still holding the lock"
+    fi
+    sleep 10
+  done
+  trap 'exit 130' INT TERM
+  set -e
+}
+
+# Waits, until lock_deadline, for Argo CD to start switching the statefulset, then holds the lock until the
+# switch (or a rollback) is complete
 wait_for_switch() {
   cat >&2 <<EOF
 ==> copy done and checked, ${src_pod} is still locked.
-    Now set mariadbOperator.primary=true and let Argo CD sync. Waiting until $(date -r "${lock_deadline}" +%H:%M:%S 2>/dev/null || date -d "@${lock_deadline}" +%H:%M:%S) for
-    statefulset ${er_sts} to use ${dst_name}... (Ctrl-C releases the lock, entity-resolution stays on Bitnami)
+    Now set mariadbOperator.primary=true and let Argo CD sync. The switch must begin before $(fmt_time "${lock_deadline}").
+    (Ctrl-C before the switch begins: the lock is released, entity-resolution stays on Bitnami)
 EOF
-  until [[ "$(er_db_host)" == "${dst_name}" ]]; do
+  until switch_begun; do
     ensure_lock_held "while waiting for the switch"
     sleep 10
   done
-  log "${er_sts} is configured to use ${dst_name}, waiting for the rollout"
-  until kubectl -n "${namespace}" rollout status "statefulset/${er_sts}" --timeout=10s >/dev/null 2>&1; do
-    if ! lock_held; then
-      die "global read lock lost on ${src_pod} during the rollout: writes may have reached it after the copy.
-    ${er_sts} already points to ${dst_name}: compare both databases ('check') before going on."
-    fi
-    (( $(date +%s) < lock_deadline )) \
-      || die "rollout of ${er_sts} not finished in time: check its pod, it already points to ${dst_name}"
-  done
-  log "rollout of ${er_sts} done"
-  # The previous pod is gone: if the lock was still held, no write reached the source after the copy
-  lock_held || die "global read lock lost on ${src_pod} before the end of the rollout: writes may have reached it
-    after the copy. ${er_sts} already points to ${dst_name}: compare both databases ('check') before going on."
+  log "statefulset ${er_sts} is being changed by Argo CD"
+  hold_switch
 }
 
 case "${command}" in
@@ -416,12 +561,22 @@ case "${command}" in
     # Checked last before letting pods use the copy: the lock must have been held from the dump until now
     ensure_lock_held "during the checks"
     # The destination is ready: from now on, entity-resolution can be switched to it
+    phase="switch"
     unfence_destination
     wait_for_switch
-    kill_source_clients
-    release_source
-    log "cutover done: ${er_sts} uses ${dst_name}. ${src_pod} is no longer used."
-    log "rollback: set mariadbOperator.primary=false (writes made on ${dst_name} since the switch would be lost)"
+    case "${switch_state}" in
+      done)
+        release_source
+        log "cutover done: ${er_sts} uses ${dst_name}. ${src_pod} is no longer used."
+        log "rollback: set mariadbOperator.primary=false (writes made on ${dst_name} since the switch would be lost)"
+        ;;
+      rolled_back)
+        die "cutover rolled back: ${er_sts} uses ${src_host} again, ${app_user} stays locked on ${dst_pod}. Run cutover again to retry."
+        ;;
+      *)
+        die "lock released on request during the switch: compare both databases ('check')"
+        ;;
+    esac
     ;;
   *)
     usage
