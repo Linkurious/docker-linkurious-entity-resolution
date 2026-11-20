@@ -24,8 +24,11 @@
 # Entity-resolution connects to the Bitnami database as root, so `read_only` would not block its writes:
 # FLUSH TABLES WITH READ LOCK does, and it is released as soon as the session holding it ends.
 # The destination database is dropped and recreated by copy and cutover. To avoid erasing data written by
-# entity-resolution, both refuse to run unless the statefulset rollout to the Bitnami database is complete,
-# every running pod uses it and no application session is open on the destination. During the copy, the
+# entity-resolution, both refuse to run unless the statefulset rollout to the Bitnami database is complete, the
+# template and every running pod positively target the Bitnami service (SENZING_DATABASE_HOST is its short name or
+# one of its in-cluster DNS names, port 3306, database -d, all as plain env values), that service and the
+# destination one route to the pods the script uses, and no application session is open on the destination.
+# Any other target (unset, set through a secret, another service or database, an IP) is refused. During the copy, the
 # application user of the destination is locked (ACCOUNT LOCK), so that a pod switched meanwhile cannot write to it.
 set -euo pipefail
 
@@ -38,9 +41,8 @@ assume_yes=false
 dst_name=""
 app_user=""
 sts_state=""
-src_host=""
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 while getopts "n:r:m:d:t:yh" opt; do
   case "${opt}" in
@@ -65,6 +67,8 @@ if [[ -z "${dst_name}" ]]; then
   dst_name="${dst_name%%-}-mariadb-op"
 fi
 dst_pod="${dst_name}-0"
+# Bitnami: the Service, the StatefulSet and the pod prefix are all "<fullname>-mariadb"
+src_service="${src_pod%-0}"
 er_sts="${release}"
 er_container="linkurious-entity-resolution"
 # Marker of the session holding the global read lock, split in queries so that they do not match themselves
@@ -92,9 +96,52 @@ confirm() {
   [[ "${answer}" == "y" || "${answer}" == "Y" ]] || die "aborted"
 }
 
-er_db_host() {
-  kubectl -n "${namespace}" get statefulset "${er_sts}" \
-    -o jsonpath="{.spec.template.spec.containers[?(@.name==\"${er_container}\")].env[?(@.name==\"SENZING_DATABASE_HOST\")].value}"
+# jsonpath of the database target of a pod spec: SENZING_DATABASE_HOST|SENZING_DATABASE_PORT|SENZING_DATABASE_NAME
+# (only plain values: a target set through envFrom or valueFrom reads as empty, and is never recognized)
+db_target_jsonpath() {
+  local spec="$1" v out=""
+  for v in HOST PORT NAME; do
+    out+="${out:+|}{${spec}.containers[?(@.name==\"${er_container}\")].env[?(@.name==\"SENZING_DATABASE_${v}\")].value}"
+  done
+  echo "${out}"
+}
+
+# Database target of the statefulset template: host|port|name
+er_db_target() {
+  kubectl -n "${namespace}" get statefulset "${er_sts}" -o jsonpath="$(db_target_jsonpath .spec.template.spec)"
+}
+
+# host_is <host> <service>: true only if <host> names <service> of the namespace, by its short name or one of its
+# in-cluster DNS names. Anything else (unset, other service, other namespace, IP, other cluster domain) is not.
+host_is() {
+  local host="${1%.}" svc="$2"
+  [[ -n "${host}" && -n "${svc}" ]] || return 1
+  case "${host}" in
+    "${svc}" | "${svc}.${namespace}" | "${svc}.${namespace}.svc" | "${svc}.${namespace}.svc.cluster.local") return 0 ;;
+  esac
+  return 1
+}
+
+# targets <host|port|name> <service>: true only if the target is positively <service>, port 3306, database ${database}
+targets() {
+  local host port name
+  IFS='|' read -r host port name <<< "$1"
+  host_is "${host}" "$2" && [[ "${port}" == "3306" && "${name}" == "${database}" ]]
+}
+
+# Pods behind a service (EndpointSlices), sorted
+service_pods() {
+  kubectl -n "${namespace}" get endpointslices -l "kubernetes.io/service-name=$1" \
+    -o jsonpath='{range .items[*]}{range .endpoints[*]}{.targetRef.name}{"\n"}{end}{end}' | sort -u
+}
+
+# Fails unless <service> exists and routes to <pod> only
+ensure_service_routes_to() {
+  local svc="$1" pod="$2" pods
+  kubectl -n "${namespace}" get service "${svc}" >/dev/null || die "service ${svc} not found"
+  pods="$(service_pods "${svc}")"
+  [[ "${pods}" == "${pod}" ]] \
+    || die "service ${svc} does not route to ${pod} only (endpoints: $(echo "${pods:-none}" | tr '\n' ' '))"
 }
 
 preflight() {
@@ -103,6 +150,10 @@ preflight() {
   kubectl -n "${namespace}" get pod "${src_pod}" >/dev/null || die "source pod ${src_pod} not found"
   kubectl -n "${namespace}" wait --for=condition=Ready "mariadb/${dst_name}" --timeout=10s >/dev/null \
     || die "MariaDB ${dst_name} is not Ready (kubectl -n ${namespace} describe mariadb ${dst_name})"
+  # The pods the script reads from and writes to must be the ones behind the hosts entity-resolution uses
+  ensure_service_routes_to "${src_service}" "${src_pod}"
+  ensure_service_routes_to "${dst_name}" "${dst_pod}"
+  log "services: ${src_service} -> ${src_pod}, ${dst_name} -> ${dst_pod}"
   log "source version: $(sql "${src_pod}" 'SELECT VERSION()')"
   log "destination version: $(sql "${dst_pod}" 'SELECT VERSION()')"
   app_user="$(kubectl -n "${namespace}" get "mariadb/${dst_name}" -o jsonpath='{.spec.username}')"
@@ -136,13 +187,15 @@ cleanup() {
   exit "${rc}"
 }
 
-# Pods of the entity-resolution statefulset, one per line: name|controller-revision-hash|SENZING_DATABASE_HOST|deletionTimestamp
+# Pods of the entity-resolution statefulset, one per line:
+# name|controller-revision-hash|deletionTimestamp|SENZING_DATABASE_HOST|SENZING_DATABASE_PORT|SENZING_DATABASE_NAME
 er_pods() {
   local selector
   # shellcheck disable=SC2016
   selector="$(kubectl -n "${namespace}" get statefulset "${er_sts}" \
     -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}')"
-  kubectl -n "${namespace}" get pods -l "${selector%,}" -o jsonpath="{range .items[*]}{.metadata.name}{\"|\"}{.metadata.labels.controller-revision-hash}{\"|\"}{.spec.containers[?(@.name==\"${er_container}\")].env[?(@.name==\"SENZING_DATABASE_HOST\")].value}{\"|\"}{.metadata.deletionTimestamp}{\"\\n\"}{end}"
+  kubectl -n "${namespace}" get pods -l "${selector%,}" \
+    -o jsonpath="{range .items[*]}{.metadata.name}|{.metadata.labels.controller-revision-hash}|{.metadata.deletionTimestamp}|$(db_target_jsonpath .spec){\"\\n\"}{end}"
 }
 
 # Snapshot of the statefulset: generation|observedGeneration|replicas|readyReplicas|updatedReplicas|currentRevision|updateRevision
@@ -157,13 +210,14 @@ dst_app_sessions() {
 }
 
 # Fails unless entity-resolution is fully rolled out on the Bitnami database: desired template, statefulset
-# status, and every running pod. Also fails if an application session is open on the destination.
+# status, and every running pod must positively target ${src_service}:3306/${database}. Also fails if an
+# application session is open on the destination.
 ensure_destination_unused() {
-  local host state gen observed replicas ready updated current update pods sessions name revision pod_host deleting bad=""
-  host="$(er_db_host)"
-  log "entity-resolution SENZING_DATABASE_HOST (template): ${host:-<unset>}"
-  [[ "${host}" != "${dst_name}" ]] \
-    || die "entity-resolution is configured to use ${dst_name}: refusing to drop its database (set mariadbOperator.primary=false first)"
+  local target state gen observed replicas ready updated current update pods sessions name revision deleting pod_target bad=""
+  target="$(er_db_target)"
+  log "entity-resolution database (template, host|port|name): ${target}"
+  targets "${target}" "${src_service}" \
+    || die "the statefulset template does not target the Bitnami database ${src_service}:3306/${database} (${target}): refusing to drop ${database} on ${dst_pod}. If it uses ${dst_name}, set mariadbOperator.primary=false first."
 
   state="$(er_sts_state)"
   IFS='|' read -r gen observed replicas ready updated current update <<< "${state}"
@@ -173,11 +227,11 @@ ensure_destination_unused() {
 
   pods="$(er_pods)"
   [[ "$(grep -c . <<< "${pods}" || true)" == "${replicas}" ]] || bad+=$'\n'"  expected ${replicas} pod(s)"
-  while IFS='|' read -r name revision pod_host deleting; do
+  while IFS='|' read -r name revision deleting pod_target; do
     [[ -n "${name}" ]] || continue
-    log "pod ${name}: revision ${revision}, SENZING_DATABASE_HOST ${pod_host:-<unset>}${deleting:+, terminating}"
+    log "pod ${name}: revision ${revision}, database ${pod_target}${deleting:+, terminating}"
     [[ "${revision}" == "${update}" ]] || bad+=$'\n'"  ${name} runs revision ${revision}, not ${update}"
-    [[ "${pod_host}" != "${dst_name}" ]] || bad+=$'\n'"  ${name} uses ${dst_name}"
+    targets "${pod_target}" "${src_service}" || bad+=$'\n'"  ${name} does not target ${src_service}:3306/${database} (${pod_target})"
     [[ -z "${deleting}" ]] || bad+=$'\n'"  ${name} is terminating"
   done <<< "${pods}"
   [[ -z "${bad}" ]] || die "entity-resolution pods are not all on the Bitnami database:${bad}"
@@ -185,7 +239,6 @@ ensure_destination_unused() {
   sessions="$(dst_app_sessions)"
   [[ -z "${sessions}" ]] || die "application sessions are open on ${dst_pod}, refusing to drop its database:"$'\n'"${sessions}"
   sts_state="${state}"
-  src_host="${host}"
 }
 
 # Hosts of the application user on the destination
@@ -219,7 +272,7 @@ ensure_fence_held() {
     sql "${dst_pod}" "SHOW CREATE USER '${app_user}'@'${h}'" | grep -q 'ACCOUNT LOCK' \
       || { keep_fenced=true; die "user ${app_user}@${h} was unlocked during the copy (operator reconcile?): the copy may not be consistent"; }
   done
-  if [[ "$(er_sts_state)" != "${sts_state}" || "$(er_db_host)" == "${dst_name}" ]]; then
+  if [[ "$(er_sts_state)" != "${sts_state}" ]] || ! targets "$(er_db_target)" "${src_service}"; then
     keep_fenced=true
     die "statefulset ${er_sts} changed during the copy (switch or rollback in progress): ${app_user} stays locked on ${dst_pod}. Check which database entity-resolution must use, then unlock it with: ALTER USER '${app_user}'@'%' ACCOUNT UNLOCK"
   fi
@@ -419,29 +472,32 @@ kill_source_clients() {
   log "killed $(echo "${ids}" | grep -c . || true) client connection(s) left on ${src_pod}"
 }
 
-# rolled_out_on <host>: true when the template, the statefulset status and every running pod use <host>
+# rolled_out_on <service>: true when the template, the statefulset status and every running pod positively
+# target <service>:3306/${database}
 rolled_out_on() {
-  local want="$1" state gen observed replicas ready updated current update pods name revision pod_host deleting n=0
-  [[ -n "${want}" && "$(er_db_host)" == "${want}" ]] || return 1
+  local svc="$1" state gen observed replicas ready updated current update pods name revision deleting pod_target n=0
+  targets "$(er_db_target)" "${svc}" || return 1
   state="$(er_sts_state)" || return 1
   IFS='|' read -r gen observed replicas ready updated current update <<< "${state}"
   [[ "${gen}" == "${observed}" && "${current}" == "${update}" && "${updated:-0}" == "${replicas}" && "${ready:-0}" == "${replicas}" ]] || return 1
   pods="$(er_pods)" || return 1
-  while IFS='|' read -r name revision pod_host deleting; do
+  while IFS='|' read -r name revision deleting pod_target; do
     [[ -n "${name}" ]] || continue
-    [[ "${revision}" == "${update}" && "${pod_host}" == "${want}" && -z "${deleting}" ]] || return 1
+    [[ "${revision}" == "${update}" && -z "${deleting}" ]] || return 1
+    targets "${pod_target}" "${svc}" || return 1
     n=$(( n + 1 ))
   done <<< "${pods}"
   (( n == replicas ))
 }
 
-# True once Argo CD has started to change the statefulset since the copy (or if it cannot be told): from then on,
-# pods may be moving to the destination and the source must stay locked until the switch is resolved.
+# True once Argo CD has started to change the statefulset since the copy, or if it cannot be told: the template no
+# longer positively targets the Bitnami database (whatever it targets), or its generation changed. From then on,
+# pods may be moving away from the source and it must stay locked until the switch is resolved.
 switch_begun() {
-  local host gen
-  host="$(er_db_host 2>/dev/null)" || return 0
+  local target gen
+  target="$(er_db_target 2>/dev/null)" || return 0
   gen="$(kubectl -n "${namespace}" get statefulset "${er_sts}" -o jsonpath='{.metadata.generation}' 2>/dev/null)" || return 0
-  [[ "${host}" == "${dst_name}" || "${gen}" != "${sts_state%%|*}" ]]
+  ! targets "${target}" "${src_service}" || [[ "${gen}" != "${sts_state%%|*}" ]]
 }
 
 # Interactive answer, never assumed: no terminal means no
@@ -473,15 +529,15 @@ hold_switch() {
   set +e
   trap 'hold_interrupted=true' INT TERM
   log "switch in progress: ${src_pod} stays locked until ${er_sts} is rolled out on ${dst_name},"
-  log "or rolled back on ${src_host} (revert mariadbOperator.primary) and confirmed. Ctrl-C shows the options."
+  log "or rolled back on ${src_service} (revert mariadbOperator.primary) and confirmed. Ctrl-C shows the options."
   while :; do
     keep_lock_alive
     if rolled_out_on "${dst_name}"; then
       finish_switch
       break
     fi
-    if rolled_out_on "${src_host}"; then
-      log "rollback done: every pod of ${er_sts} uses ${src_host} again"
+    if rolled_out_on "${src_service}"; then
+      log "rollback done: every pod of ${er_sts} uses ${src_service} again"
       if ${assume_yes} || ask_tty "Release the lock on ${src_pod}? Writes made on ${dst_name} since the switch are not on Bitnami. Type 'rollback' to confirm:" rollback; then
         # The copy is now stale: no pod may use it until a new cutover
         keep_fenced=true
@@ -492,7 +548,7 @@ hold_switch() {
     fi
     if ${hold_interrupted}; then
       hold_interrupted=false
-      log "statefulset ${er_sts}: $(er_sts_state), template SENZING_DATABASE_HOST: $(er_db_host)"
+      log "statefulset ${er_sts}: $(er_sts_state), template database: $(er_db_target)"
       er_pods >&2
       if ask_tty "Release the lock anyway? Pods on Bitnami and on ${dst_name} may then split the writes. Type 'release' to confirm:" release; then
         log "WARNING: lock released during the switch on request"
@@ -526,9 +582,9 @@ EOF
 case "${command}" in
   check)
     preflight
-    log "entity-resolution SENZING_DATABASE_HOST (template): $(er_db_host)"
+    log "entity-resolution database (template, host|port|name): $(er_db_target)"
     log "statefulset ${er_sts} (generation|observed|replicas|ready|updated|currentRevision|updateRevision): $(er_sts_state)"
-    log "pods (name|revision|SENZING_DATABASE_HOST|deletionTimestamp):"; er_pods >&2
+    log "pods (name|revision|deletionTimestamp|host|port|name):"; er_pods >&2
     log "application sessions on the destination: $(dst_app_sessions | grep -c . || true)"
     log "source row counts:";      row_counts "${src_pod}"
     log "destination row counts:"; row_counts "${dst_pod}"
@@ -578,7 +634,7 @@ case "${command}" in
         log "rollback: set mariadbOperator.primary=false (writes made on ${dst_name} since the switch would be lost)"
         ;;
       rolled_back)
-        die "cutover rolled back: ${er_sts} uses ${src_host} again, ${app_user} stays locked on ${dst_pod}. Run cutover again to retry."
+        die "cutover rolled back: ${er_sts} uses ${src_service} again, ${app_user} stays locked on ${dst_pod}. Run cutover again to retry."
         ;;
       *)
         die "lock released on request during the switch: compare both databases ('check')"
