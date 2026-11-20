@@ -251,6 +251,15 @@ copy_data() {
   read -r charset collation < <(sql "${src_pod}" \
     "SELECT default_character_set_name, default_collation_name FROM information_schema.schemata WHERE schema_name='${database}'")
   [[ -n "${charset}" ]] || die "database ${database} not found on ${src_pod}"
+  preflight
+  ensure_template_on_source
+  if [[ "${command}" == "migrate" ]]; then
+    ensure_er_stopped
+    ensure_no_client_on_source
+  else
+    ensure_pods_on_source
+  fi
+  ensure_no_session_on_destination
   log "dropping and recreating database ${database} (${charset}/${collation}) on ${dst_pod}"
   sql "${dst_pod}" "DROP DATABASE IF EXISTS \`${database}\`; CREATE DATABASE \`${database}\` CHARACTER SET ${charset} COLLATE ${collation}"
   log "streaming dump ${src_pod} -> ${dst_pod}"
