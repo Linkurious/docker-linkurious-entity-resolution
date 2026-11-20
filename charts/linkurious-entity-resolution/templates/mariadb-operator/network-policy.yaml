@@ -1,0 +1,77 @@
+{{- if and .Values.mariadbOperator.enabled .Values.networkPolicies.create }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "linkurious-entity-resolution.mariadbOperator.fullname" . }}
+  namespace: "{{ .Release.Namespace }}"
+  labels:
+    {{- include "linkurious-entity-resolution.labelsMariadbOperator" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "linkurious-entity-resolution.selectorLabelsMariadbOperator" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # linkurious-entity-resolution (its egress to the database is allowed by namespace-netpol.yaml)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "linkurious-entity-resolution.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 3306
+    # mariadb-operator (reconciles users, databases and grants, checks health over SQL)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.mariadbOperator.operatorNamespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mariadb-operator
+      ports:
+        - port: 3306
+    {{- if .Values.mariadbOperator.metrics.enabled }}
+    # mysqld-exporter (separate pod, unlike the Bitnami sidecar)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "linkurious-entity-resolution.selectorLabelsMariadbOperatorMetrics" . | nindent 14 }}
+      ports:
+        - port: 3306
+    {{- end }}
+{{- if .Values.mariadbOperator.metrics.enabled }}
+---
+# Egress of the mysqld-exporter to the database. Its ingress (Prometheus scraping port 9104) is left to the
+# namespace policies (default-network-policy in k8s-dev allows Prometheus from the monitoring namespace).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "linkurious-entity-resolution.mariadbOperator.fullname" . }}-metrics
+  namespace: "{{ .Release.Namespace }}"
+  labels:
+    {{- include "linkurious-entity-resolution.labelsMariadbOperator" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "linkurious-entity-resolution.selectorLabelsMariadbOperatorMetrics" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "linkurious-entity-resolution.selectorLabelsMariadbOperator" . | nindent 14 }}
+      ports:
+        - port: 3306
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}
+{{- end }}
