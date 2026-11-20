@@ -102,7 +102,10 @@ Secret holding the passwords of the mariadb-operator MariaDB (keys mariadb-root-
 "true" when linkurious-entity-resolution uses the mariadb-operator MariaDB instead of the Bitnami one
 */}}
 {{- define "linkurious-entity-resolution.mariadbOperator.primary" -}}
-{{- if and .Values.mariadbOperator.enabled .Values.mariadbOperator.primary -}}
+{{- if .Values.mariadbOperator.primary -}}
+{{- if not .Values.mariadbOperator.enabled -}}
+{{- fail "mariadbOperator.primary requires mariadbOperator.enabled" -}}
+{{- end -}}
 true
 {{- end -}}
 {{- end }}
