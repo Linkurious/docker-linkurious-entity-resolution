@@ -11,10 +11,12 @@
 #   copy     rehearsal: copy the data while entity-resolution keeps writing to the Bitnami database
 #            (consistent snapshot, but writes made after it are not copied), then compare row counts
 #   cutover  block the writes on the Bitnami database (global read lock), copy the data, compare row counts, then
-#            wait (up to -t minutes, default 30) for entity-resolution to be restarted on the new database
-#            (mariadbOperator.primary=true synced by Argo CD), and release the lock.
-#            Entity-resolution writes hang while the lock is held. If the wait times out or the script is
+#            wait for entity-resolution to be restarted on the new database (mariadbOperator.primary=true synced
+#            by Argo CD), and release the lock. -t (default 30) is the maximum time the lock is held, copy included.
+#            Entity-resolution writes hang while the lock is held. If the time runs out or the script is
 #            interrupted, the lock is released and entity-resolution keeps using the Bitnami database.
+#            If the lock session disappears (source pod restart, killed session, kubectl exec cut), the cutover
+#            is aborted and the destination user stays locked, so that no pod uses a copy missing later writes.
 #
 # Entity-resolution connects to the Bitnami database as root, so `read_only` would not block its writes:
 # FLUSH TABLES WITH READ LOCK does, and it is released as soon as the session holding it ends.
@@ -34,7 +36,7 @@ dst_name=""
 app_user=""
 sts_state=""
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 while getopts "n:r:m:d:t:yh" opt; do
   case "${opt}" in
@@ -173,7 +175,7 @@ fence_destination() {
   local hosts h ids
   hosts="$(app_user_hosts)"
   [[ -n "${hosts}" ]] || die "user ${app_user} not found on ${dst_pod}"
-  log "locking user ${app_user} on ${dst_pod} during the copy"
+  log "locking user ${app_user} on ${dst_pod}"
   fenced=true
   for h in ${hosts}; do
     sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT LOCK"
@@ -259,14 +261,21 @@ lock_session_id() {
 }
 
 lock_pid=""
+lock_id=""
+# Time (epoch) by which the cutover must be done, set when the lock is taken. The lock session sleeps
+# lock_margin seconds longer, so it outlives every step of the script; it only expires on its own if the script
+# dies without releasing it (kill -9, lost laptop...), which bounds how long the source can stay locked.
+lock_deadline=0
+lock_margin=600
 lock_source() {
   local id=""
-  log "taking the global read lock on ${src_pod} (entity-resolution writes hang from now on)"
-  # The session stays open (SLEEP) to keep the lock; it is killed by release_source
+  log "taking the global read lock on ${src_pod} (entity-resolution writes hang from now on, ${wait_minutes} min max)"
+  # The session stays open (SLEEP) to keep the lock; it is killed by release_source.
+  # SLEEP starts once FLUSH TABLES WITH READ LOCK returns, i.e. after the lock is taken.
   # shellcheck disable=SC2016
   kubectl -n "${namespace}" exec "${src_pod}" -c mariadb -- sh -c \
     "${remote_auth}"' exec "$(command -v mariadb || command -v mysql)" -uroot -N -B -e "$1"' sh \
-    "FLUSH TABLES WITH READ LOCK; SELECT '${lock_marker}', SLEEP($(( (wait_minutes + 10) * 60 )))" >/dev/null &
+    "FLUSH TABLES WITH READ LOCK; SELECT '${lock_marker}', SLEEP($(( wait_minutes * 60 + lock_margin )))" >/dev/null &
   lock_pid=$!
   for _ in $(seq 1 60); do
     id="$(lock_session_id)"
@@ -275,7 +284,40 @@ lock_source() {
     sleep 1
   done
   [[ -n "${id}" ]] || die "could not take the global read lock in 60s (long running query on ${src_pod}?)"
-  log "global read lock held by session ${id}"
+  lock_id="${id}"
+  lock_deadline=$(( $(date +%s) + wait_minutes * 60 ))
+  log "global read lock held by session ${lock_id}, until $(date -r "${lock_deadline}" +%H:%M:%S 2>/dev/null || date -d "@${lock_deadline}" +%H:%M:%S)"
+}
+
+# True while the lock is held: the local kubectl exec is alive and the same session is still sleeping on the
+# source. A failed check is retried, so that a transient API error does not abort the cutover.
+lock_held() {
+  local _try
+  for _try in 1 2 3; do
+    kill -0 "${lock_pid}" 2>/dev/null || return 1
+    [[ "$(lock_session_id 2>/dev/null || true)" == "${lock_id}" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Aborts the cutover if the lock is lost or about to expire. Writes may have resumed on the source after the
+# dump: the destination user is (re)locked and left locked, so that no pod switched to the copy can use it.
+ensure_lock_held() {
+  local step="$1"
+  if ! lock_held; then
+    keep_fenced=true
+    ${fenced} || fence_destination
+    die "global read lock lost on ${src_pod} ${step}: writes may have resumed there after the copy.
+    ${app_user} stays locked on ${dst_pod}. If mariadbOperator.primary=true was merged, revert it and wait for
+    the rollout, then run cutover again."
+  fi
+  if (( $(date +%s) >= lock_deadline )); then
+    keep_fenced=true
+    ${fenced} || fence_destination
+    die "the ${wait_minutes} min of the lock ran out ${step}. ${app_user} stays locked on ${dst_pod}.
+    If mariadbOperator.primary=true was merged, revert it and wait for the rollout, then run cutover again (-t)."
+  fi
 }
 
 release_source() {
@@ -288,6 +330,7 @@ release_source() {
   fi
   kill "${lock_pid}" 2>/dev/null || true
   lock_pid=""
+  lock_id=""
 }
 
 # Kills the client connections left on the source (from the previous entity-resolution pod), so that statements
@@ -301,20 +344,31 @@ kill_source_clients() {
   log "killed $(echo "${ids}" | grep -c . || true) client connection(s) left on ${src_pod}"
 }
 
+# Waits, until lock_deadline, for the statefulset to point to the destination and be rolled out, checking the
+# lock at every step
 wait_for_switch() {
-  local deadline=$(( $(date +%s) + wait_minutes * 60 ))
   cat >&2 <<EOF
 ==> copy done and checked, ${src_pod} is still locked.
-    Now set mariadbOperator.primary=true and let Argo CD sync. Waiting up to ${wait_minutes} min for
+    Now set mariadbOperator.primary=true and let Argo CD sync. Waiting until $(date -r "${lock_deadline}" +%H:%M:%S 2>/dev/null || date -d "@${lock_deadline}" +%H:%M:%S) for
     statefulset ${er_sts} to use ${dst_name}... (Ctrl-C releases the lock, entity-resolution stays on Bitnami)
 EOF
   until [[ "$(er_db_host)" == "${dst_name}" ]]; do
-    (( $(date +%s) < deadline )) || die "timeout: ${er_sts} still uses $(er_db_host)"
+    ensure_lock_held "while waiting for the switch"
     sleep 10
   done
   log "${er_sts} is configured to use ${dst_name}, waiting for the rollout"
-  kubectl -n "${namespace}" rollout status "statefulset/${er_sts}" --timeout="$(( deadline - $(date +%s) ))s" >&2 \
-    || die "rollout of ${er_sts} not finished: check its pod, it already points to ${dst_name}"
+  until kubectl -n "${namespace}" rollout status "statefulset/${er_sts}" --timeout=10s >/dev/null 2>&1; do
+    if ! lock_held; then
+      die "global read lock lost on ${src_pod} during the rollout: writes may have reached it after the copy.
+    ${er_sts} already points to ${dst_name}: compare both databases ('check') before going on."
+    fi
+    (( $(date +%s) < lock_deadline )) \
+      || die "rollout of ${er_sts} not finished in time: check its pod, it already points to ${dst_name}"
+  done
+  log "rollout of ${er_sts} done"
+  # The previous pod is gone: if the lock was still held, no write reached the source after the copy
+  lock_held || die "global read lock lost on ${src_pod} before the end of the rollout: writes may have reached it
+    after the copy. ${er_sts} already points to ${dst_name}: compare both databases ('check') before going on."
 }
 
 case "${command}" in
@@ -356,8 +410,11 @@ case "${command}" in
     ensure_destination_unused
     lock_source
     copy_data
+    ensure_lock_held "during the copy"
     verify
     ensure_fence_held
+    # Checked last before letting pods use the copy: the lock must have been held from the dump until now
+    ensure_lock_held "during the checks"
     # The destination is ready: from now on, entity-resolution can be switched to it
     unfence_destination
     wait_for_switch
