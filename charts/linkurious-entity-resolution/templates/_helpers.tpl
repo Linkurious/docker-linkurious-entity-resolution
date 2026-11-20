@@ -55,7 +55,7 @@ Name of the MariaDB run by the mariadb-operator (MariaDB resource, StatefulSet a
 It differs from the Bitnami one ("<fullname>-mariadb") so that both can run side by side during the migration.
 */}}
 {{- define "linkurious-entity-resolution.mariadbOperator.fullname" -}}
-{{- printf "%s-mariadb-op" (include "linkurious-entity-resolution.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- printf "%s-mariadb-op" (include "linkurious-entity-resolution.fullname" . | trunc 52 | trimSuffix "-") }}
 {{- end }}
 
 {{/*
