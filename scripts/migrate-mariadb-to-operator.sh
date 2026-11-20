@@ -176,11 +176,14 @@ cleanup() {
     else
       # Nothing switched yet, but the copy becomes stale once the source is writable again
       keep_fenced=true
-      ${fenced} || fence_destination
     fi
   fi
   if [[ "${phase}" != "switch" ]] && ${fenced}; then
     keep_fenced=true
+  fi
+  # The stale copy is positively fenced before the source accepts writes again
+  if ${keep_fenced}; then
+    secure_fence || rc=1
   fi
   unfence_destination
   release_source
@@ -241,52 +244,114 @@ ensure_destination_unused() {
   sts_state="${state}"
 }
 
-# Hosts of the application user on the destination
+# Accounts (hosts) of the application user on the destination. Fails if the lookup fails or finds no account:
+# an empty answer is never taken for "nothing to lock".
 app_user_hosts() {
-  sql "${dst_pod}" "SELECT host FROM mysql.user WHERE user = '${app_user}'"
+  local hosts
+  hosts="$(sql "${dst_pod}" "SELECT host FROM mysql.user WHERE user = '${app_user}'")" \
+    || { log "cannot list the accounts of ${app_user} on ${dst_pod}"; return 1; }
+  [[ -n "${hosts}" ]] || { log "no account ${app_user} on ${dst_pod}"; return 1; }
+  echo "${hosts}"
 }
 
-# Locks the application user of the destination and kills its sessions: until unfence_destination, a pod switched
-# to the destination (Argo CD sync during the copy) cannot connect, so the drop/copy cannot erase its writes.
-fenced=false
-keep_fenced=false
-fence_destination() {
-  local hosts h ids
-  hosts="$(app_user_hosts)"
-  [[ -n "${hosts}" ]] || die "user ${app_user} not found on ${dst_pod}"
-  log "locking user ${app_user} on ${dst_pod}"
+# Ids of the sessions of the application user on the destination (fails if they cannot be listed)
+app_user_sessions() {
+  sql "${dst_pod}" "SELECT id FROM information_schema.processlist WHERE user = '${app_user}' AND id <> CONNECTION_ID()"
+}
+
+# True only if every account of the application user is positively locked and none of its sessions is left.
+# A failed lookup counts as not fenced.
+verify_fence() {
+  local hosts h create sessions
+  hosts="$(app_user_hosts)" || return 1
+  for h in ${hosts}; do
+    create="$(sql "${dst_pod}" "SHOW CREATE USER '${app_user}'@'${h}'")" \
+      || { log "cannot read the account ${app_user}@${h}"; return 1; }
+    grep -q 'ACCOUNT LOCK' <<< "${create}" || { log "account ${app_user}@${h} is not locked"; return 1; }
+  done
+  sessions="$(app_user_sessions)" || { log "cannot list the sessions of ${app_user}"; return 1; }
+  [[ -z "${sessions}" ]] || { log "sessions of ${app_user} still open: $(tr '\n' ' ' <<< "${sessions}")"; return 1; }
+}
+
+# Locks every account of the application user, kills its sessions (including ones opened while it was unlocked),
+# waits for them to end and verifies the result. Idempotent. Fails if the fence cannot be verified.
+establish_fence() {
+  local hosts h id _try
+  hosts="$(app_user_hosts)" || return 1
+  # From the first lock on, cleanup knows the destination was touched (a failure before it changes nothing)
   fenced=true
   for h in ${hosts}; do
-    sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT LOCK"
+    sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT LOCK" || { log "cannot lock ${app_user}@${h}"; return 1; }
   done
-  ids="$(sql "${dst_pod}" "SELECT id FROM information_schema.processlist WHERE user = '${app_user}' AND id <> CONNECTION_ID()")"
-  for id in ${ids}; do
-    sql "${dst_pod}" "KILL ${id}" 2>/dev/null || true
+  # Killed sessions stay listed until they end: kill and check again for up to 10s
+  for _try in 1 2 3 4 5 6 7 8 9; do
+    for id in $(app_user_sessions 2>/dev/null || true); do
+      sql "${dst_pod}" "KILL ${id}" 2>/dev/null || true
+    done
+    verify_fence 2>/dev/null && return 0
+    sleep 1
   done
+  verify_fence
+}
+
+# Locks the application user of the destination: until unfence_destination, a pod switched to the destination
+# (Argo CD sync during the copy) cannot connect, so the drop/copy cannot erase its writes.
+fenced=false
+# keep_fenced: the destination copy must not be used (stale, or state unclear). cleanup then re-establishes and
+# verifies the fence before the source lock is released (secure_fence).
+keep_fenced=false
+fence_destination() {
+  log "locking user ${app_user} on ${dst_pod}"
+  establish_fence || die "could not lock user ${app_user} on ${dst_pod}"
+  log "user ${app_user} locked on ${dst_pod} (verified)"
 }
 
 # Checks that the destination stayed fenced and that entity-resolution did not change during the copy
 ensure_fence_held() {
-  local h
-  for h in $(app_user_hosts); do
-    sql "${dst_pod}" "SHOW CREATE USER '${app_user}'@'${h}'" | grep -q 'ACCOUNT LOCK' \
-      || { keep_fenced=true; die "user ${app_user}@${h} was unlocked during the copy (operator reconcile?): the copy may not be consistent"; }
-  done
+  if ! verify_fence; then
+    keep_fenced=true
+    log "the lock of ${app_user} on ${dst_pod} was lost during the copy (operator reconcile?), locking it again"
+    establish_fence || true
+    die "user ${app_user} was not locked on ${dst_pod} during the copy: the copy may not be consistent, run it again"
+  fi
   if [[ "$(er_sts_state)" != "${sts_state}" ]] || ! targets "$(er_db_target)" "${src_service}"; then
     keep_fenced=true
     die "statefulset ${er_sts} changed during the copy (switch or rollback in progress): ${app_user} stays locked on ${dst_pod}. Check which database entity-resolution must use, then unlock it with: ALTER USER '${app_user}'@'%' ACCOUNT UNLOCK"
   fi
 }
 
+# Before the source becomes writable again, the stale destination must be positively fenced. While it cannot be,
+# the source lock (if any) is kept and renewed, and the fence retried; Ctrl-C offers to give up.
+secure_fence() {
+  hold_interrupted=false
+  trap 'hold_interrupted=true' INT TERM
+  until establish_fence; do
+    [[ -z "${lock_pid}" ]] || keep_lock_alive
+    log "WARNING: cannot lock ${app_user} on ${dst_pod}${lock_pid:+, ${src_pod} stays locked}; retrying in 10s (Ctrl-C for options)"
+    if ${hold_interrupted}; then
+      hold_interrupted=false
+      if ask_tty "Give up? ${dst_pod} may stay usable with a stale copy${lock_pid:+ once ${src_pod} is unlocked}. Type 'giveup' to confirm:" giveup; then
+        log "WARNING: gave up locking ${app_user} on ${dst_pod}: make sure no pod uses ${dst_name}"
+        trap 'exit 130' INT TERM
+        return 1
+      fi
+    fi
+    sleep 10
+  done
+  trap 'exit 130' INT TERM
+  log "user ${app_user} left locked on ${dst_pod} (verified)"
+}
+
+# Unlocks the application user and verifies it. Fails (and leaves fenced=true) if it cannot be done.
 unfence_destination() {
-  local h
+  local hosts h
   ${fenced} || return 0
-  if ${keep_fenced}; then
-    log "user ${app_user} left locked on ${dst_pod}"
-    return 0
-  fi
-  for h in $(app_user_hosts); do
-    sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT UNLOCK" || true
+  ${keep_fenced} && return 0
+  hosts="$(app_user_hosts)" || return 1
+  for h in ${hosts}; do
+    sql "${dst_pod}" "ALTER USER '${app_user}'@'${h}' ACCOUNT UNLOCK" || { log "cannot unlock ${app_user}@${h}"; return 1; }
+    ! sql "${dst_pod}" "SHOW CREATE USER '${app_user}'@'${h}'" | grep -q 'ACCOUNT LOCK' \
+      || { log "${app_user}@${h} is still locked"; return 1; }
   done
   fenced=false
   log "user ${app_user} unlocked on ${dst_pod}"
@@ -408,14 +473,14 @@ ensure_lock_held() {
   local step="$1"
   if ! lock_held; then
     keep_fenced=true
-    ${fenced} || fence_destination
+    establish_fence || true
     die "global read lock lost on ${src_pod} ${step}: writes may have resumed there after the copy.
     ${app_user} stays locked on ${dst_pod}. If mariadbOperator.primary=true was merged, revert it and wait for
     the rollout, then run cutover again."
   fi
   if (( $(date +%s) >= lock_deadline )); then
     keep_fenced=true
-    ${fenced} || fence_destination
+    establish_fence || true
     die "the ${wait_minutes} min of the lock ran out ${step}. ${app_user} stays locked on ${dst_pod}.
     If mariadbOperator.primary=true was merged, revert it and wait for the rollout, then run cutover again (-t)."
   fi
@@ -541,7 +606,7 @@ hold_switch() {
       if ${assume_yes} || ask_tty "Release the lock on ${src_pod}? Writes made on ${dst_name} since the switch are not on Bitnami. Type 'rollback' to confirm:" rollback; then
         # The copy is now stale: no pod may use it until a new cutover
         keep_fenced=true
-        fence_destination
+        establish_fence || true
         switch_state="rolled_back"
         break
       fi
@@ -605,7 +670,7 @@ case "${command}" in
     copy_data
     verify
     ensure_fence_held
-    unfence_destination
+    unfence_destination || die "could not unlock user ${app_user} on ${dst_pod}"
     log "rehearsal done: writes made after the dump are not copied, run 'cutover' for the final copy"
     ;;
   cutover)
@@ -625,7 +690,7 @@ case "${command}" in
     ensure_lock_held "during the checks"
     # The destination is ready: from now on, entity-resolution can be switched to it
     phase="switch"
-    unfence_destination
+    unfence_destination || die "could not unlock user ${app_user} on ${dst_pod}"
     wait_for_switch
     case "${switch_state}" in
       done)
