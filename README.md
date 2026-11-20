@@ -41,8 +41,9 @@ until the new one is validated:
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop check
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop copy
    ```
-3. Stop entity-resolution: set `replicaCount: 0` and let Argo CD sync. Change it in the values, not with
-   `kubectl scale`: Argo CD (selfHeal) would revert it. Entity-resolution is unavailable from now on.
+3. Stop entity-resolution: set `autoscaling.enabled: false` (if enabled) and `replicaCount: 0` in the same values
+   change, then let Argo CD sync. Change the values in Git, not with `kubectl scale`: Argo CD (selfHeal) would revert
+   it. Entity-resolution is unavailable from now on; restore autoscaling only after the cutover.
 4. Final copy, with entity-resolution stopped:
    ```sh
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop migrate
