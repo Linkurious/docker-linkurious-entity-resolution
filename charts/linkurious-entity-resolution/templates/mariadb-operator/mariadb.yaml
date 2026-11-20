@@ -16,8 +16,8 @@ spec:
     key: mariadb-root-password
     generate: false
   # Initial database and user (granted ALL PRIVILEGES on the database by the operator)
-  database: {{ $op.auth.database }}
-  username: {{ $op.auth.username }}
+  database: {{ $op.auth.database | quote }}
+  username: {{ $op.auth.username | quote }}
   passwordSecretKeyRef:
     name: {{ $secret }}
     key: mariadb-password
