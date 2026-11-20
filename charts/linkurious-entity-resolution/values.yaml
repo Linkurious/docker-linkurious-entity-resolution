@@ -219,9 +219,10 @@ mariadb:
 ## The operator itself is cluster-wide and is not deployed by this chart.
 ## Migration steps (scripts/migrate-mariadb-to-operator.sh):
 ##   1. enabled: true, primary: false -> an empty database is created next to the Bitnami one
-##   2. the script copies the data from the Bitnami database
-##   3. primary: true -> linkurious-entity-resolution connects to this database
-##   4. once validated, the Bitnami database is disabled (`mariadb.enabled: false`)
+##   2. replicaCount: 0 -> linkurious-entity-resolution is stopped
+##   3. the script (migrate) copies the data from the Bitnami database
+##   4. primary: true and replicaCount: 1 -> linkurious-entity-resolution restarts on this database
+##   5. once validated, the Bitnami database is disabled (`mariadb.enabled: false`)
 ## ref: https://github.com/mariadb-operator/mariadb-operator/blob/main/docs/api_reference.md
 mariadbOperator:
   # -- Create a MariaDB resource, run by the mariadb-operator

@@ -33,22 +33,27 @@ until the new one is validated:
    In k8s-dev, this secret is a SealedSecret (`<release>-mariadb` in preprod).
 1. `mariadbOperator.enabled: true`, `primary: false`: an empty database is created next to the Bitnami one, with
    the same secret. Entity-resolution still uses the Bitnami database.
-2. Rehearsal: copy the data while entity-resolution keeps running, and compare row counts:
+2. Rehearsal (optional): copy the data while entity-resolution keeps running, and compare row counts (differences
+   are only reported, entity-resolution keeps writing):
    ```sh
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop check
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop copy
    ```
-3. Cutover: have the `mariadbOperator.primary: true` change ready to merge, then run
+3. Stop entity-resolution: set `replicaCount: 0` and let Argo CD sync. Change it in the values, not with
+   `kubectl scale`: Argo CD (selfHeal) would revert it. Entity-resolution is unavailable from now on.
+4. Final copy, with entity-resolution stopped:
    ```sh
-   scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop cutover
+   scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop migrate
    ```
-   The writes on the Bitnami database are blocked (global read lock: entity-resolution connects as root, so
-   `read_only` would not stop it), the data is copied again and checked, then the script waits for
-   entity-resolution to be restarted on `<release>-mariadb-op`: merge the change and let Argo CD sync.
-   Once switched, entity-resolution connects with the `mariadbOperator.auth.username` user (ALL PRIVILEGES on the
-   database) instead of root.
-   Rollback: set `primary` back to `false` (data written on the new database since the switch is lost).
-4. Once validated, set `mariadb.enabled: false`. Argo CD does not delete the PVC of the Bitnami database,
+   It refuses to run unless the statefulset has 0 replicas and no pod left, still targets the Bitnami database,
+   and no client is connected to either database. It copies the data, compares row counts, and checks again that
+   entity-resolution stayed stopped.
+5. Restart entity-resolution on the new database: set `mariadbOperator.primary: true` **and** `replicaCount: 1` in
+   the same change, and let Argo CD sync. Do not set `primary: true` before step 4 is done: entity-resolution would
+   start on an incomplete copy. Once switched, it connects with the `mariadbOperator.auth.username` user
+   (ALL PRIVILEGES on the database) instead of root. Check it with `check`.
+   Rollback: set `primary` back to `false`. The Bitnami database is unchanged, data written on the new one is lost.
+6. Once validated, set `mariadb.enabled: false`. Argo CD does not delete the PVC of the Bitnami database,
    it can be removed by hand afterwards. The existing secret of step 0 is kept, the new database still uses it.
 
 Only the application database is copied. `check` lists the users that only exist on the Bitnami database.
