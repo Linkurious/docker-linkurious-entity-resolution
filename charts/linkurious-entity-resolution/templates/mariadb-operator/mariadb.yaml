@@ -40,4 +40,23 @@ spec:
     annotations:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+  {{- if $op.metrics.enabled }}
+  # mysqld-exporter run by the operator: Deployment, Service and ServiceMonitor "<name>-metrics", with its own
+  # user and generated password (Secret "<name>-metrics-password")
+  metrics:
+    enabled: true
+    exporter:
+      {{- with $op.metrics.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    serviceMonitor:
+      prometheusRelease: {{ $op.metrics.serviceMonitor.prometheusRelease | quote }}
+      {{- with $op.metrics.serviceMonitor.interval }}
+      interval: {{ . | quote }}
+      {{- end }}
+      {{- with $op.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . | quote }}
+      {{- end }}
+  {{- end }}
 {{- end }}

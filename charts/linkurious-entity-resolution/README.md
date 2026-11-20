@@ -89,6 +89,11 @@ helm upgrade --install my-release linkurious-entity-resolution-0.0.16.tgz -f val
 | mariadbOperator.auth.username | string | `"linkurious"` | User created by the operator, with ALL PRIVILEGES on the database (password: mariadb-password), used by linkurious-entity-resolution once primary is true |
 | mariadbOperator.enabled | bool | `false` | Create a MariaDB resource, run by the mariadb-operator |
 | mariadbOperator.image | string | `"docker.io/mariadb:11.4.6"` | MariaDB image. Keep the same version as the Bitnami MariaDB during the migration |
+| mariadbOperator.metrics.enabled | bool | `false` | Deploy a mysqld-exporter managed by the operator (Deployment, Service and ServiceMonitor "<name>-metrics"), with its own user and generated password. Replaces mariadb.metrics of the Bitnami MariaDB. |
+| mariadbOperator.metrics.resources | object | `{"limits":{"cpu":"150m","memory":"192Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}` | Resources of the exporter (same as the Bitnami metrics sidecar) |
+| mariadbOperator.metrics.serviceMonitor.interval | string | `"30s"` |  |
+| mariadbOperator.metrics.serviceMonitor.prometheusRelease | string | `"kube-prometheus-stack"` | Value of the "release" label of the ServiceMonitor, used by the Prometheus operator to select it |
+| mariadbOperator.metrics.serviceMonitor.scrapeTimeout | string | `"10s"` |  |
 | mariadbOperator.myCnf | string | `"[mariadb]\nskip-name-resolve\ncharacter-set-server=utf8mb3\ncollation-server=utf8mb3_general_ci\nmax_allowed_packet=16M\ninnodb_doublewrite=0\ninnodb_file_per_table=1\ninnodb_flush_log_at_trx_commit=0\ninnodb_flush_neighbors=0\n"` | my.cnf content, same settings as the Bitnami MariaDB (mariadb.primary.extraFlags and its defaults) |
 | mariadbOperator.operatorNamespace | string | `"mariadb-operator"` | Namespace of the mariadb-operator, allowed to connect to the database |
 | mariadbOperator.persistence.size | string | `"1Gi"` |  |

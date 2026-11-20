@@ -68,6 +68,15 @@ app.kubernetes.io/instance: {{ include "linkurious-entity-resolution.mariadbOper
 {{- end }}
 
 {{/*
+Selector labels of the mysqld-exporter pods the operator deploys when mariadbOperator.metrics.enabled is true
+(Deployment "<MariaDB name>-metrics", see WithMetricsSelectorLabels in the mariadb-operator)
+*/}}
+{{- define "linkurious-entity-resolution.selectorLabelsMariadbOperatorMetrics" -}}
+app.kubernetes.io/name: exporter
+app.kubernetes.io/instance: {{ include "linkurious-entity-resolution.mariadbOperator.fullname" . }}-metrics
+{{- end }}
+
+{{/*
 Common labels of the mariadb-operator resources
 */}}
 {{- define "linkurious-entity-resolution.labelsMariadbOperator" -}}

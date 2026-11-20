@@ -255,6 +255,23 @@ mariadbOperator:
       cpu: 500m
       memory: 512Mi
   podAnnotations: {}
+  metrics:
+    # -- Deploy a mysqld-exporter managed by the operator (Deployment, Service and ServiceMonitor "<name>-metrics"),
+    # with its own user and generated password. Replaces mariadb.metrics of the Bitnami MariaDB.
+    enabled: false
+    # -- Resources of the exporter (same as the Bitnami metrics sidecar)
+    resources:
+      limits:
+        cpu: 150m
+        memory: 192Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+    serviceMonitor:
+      # -- Value of the "release" label of the ServiceMonitor, used by the Prometheus operator to select it
+      prometheusRelease: kube-prometheus-stack
+      interval: 30s
+      scrapeTimeout: 10s
   # -- my.cnf content, same settings as the Bitnami MariaDB (mariadb.primary.extraFlags and its defaults)
   myCnf: |
     [mariadb]

@@ -35,6 +35,9 @@ until the new one is validated:
    `mariadbOperator.persistence.size` with room for MariaDB overhead and growth (the default is only `1Gi`).
    Then set `mariadbOperator.enabled: true`, `primary: false`: an empty database is created next to the Bitnami one,
    with the same secret. Entity-resolution still uses the Bitnami database.
+   To keep the metrics of the Bitnami database (`mariadb.metrics`), also set `mariadbOperator.metrics.enabled: true`:
+   the operator deploys a mysqld-exporter (`<release>-mariadb-op-metrics`) with its own user, and a ServiceMonitor
+   labeled `release: kube-prometheus-stack` (`mariadbOperator.metrics.serviceMonitor.prometheusRelease`).
 2. Rehearsal (optional): copy the data while entity-resolution keeps running, and compare row counts (differences
    are only reported, entity-resolution keeps writing):
    ```sh
