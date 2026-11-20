@@ -70,7 +70,7 @@ spec:
             - name: 'SENZING_DATABASE_PASSWORD'
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "linkurious-entity-resolution.fullname" . }}-mariadb
+                  name: {{ include "linkurious-entity-resolution.mariadb.secretName" . }}
                   key: mariadb-root-password
             - name: 'SENZING_DATABASE_NAME'
               value: {{ .Values.mariadb.auth.database | quote }}
