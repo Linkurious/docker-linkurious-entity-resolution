@@ -330,7 +330,10 @@ verify() {
 }
 
 copy_data() {
-  local charset collation
+  local charset collation destination_database
+  destination_database="$(kubectl -n "${namespace}" get "mariadb/${dst_name}" -o jsonpath='{.spec.database}')"
+  [[ "${destination_database}" == "${database}" ]] \
+    || die "destination database is ${destination_database:-<unset>}, not ${database}: refusing to copy"
   read -r charset collation < <(sql "${src_pod}" \
     "SELECT default_character_set_name, default_collation_name FROM information_schema.schemata WHERE schema_name='${database}'")
   [[ -n "${charset}" ]] || die "database ${database} not found on ${src_pod}"
