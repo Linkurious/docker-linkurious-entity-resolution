@@ -56,8 +56,10 @@ until the new one is validated:
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop migrate
    ```
    It refuses to run unless the statefulset has 0 replicas and no pod left, still targets the Bitnami database,
-   and no client is connected to either database. It copies the data, compares row counts, and checks again that
-   entity-resolution stayed stopped.
+   and no client is connected to either database. Every session counts, root sessions opened with `kubectl exec`
+   included: only the connections of the Bitnami metrics sidecar (identified by their client port) are ignored, so
+   close any client before running it. The dump holds a global read lock on the source (`--lock-all-tables`), then the
+   script compares row counts and checks again that entity-resolution stayed stopped and no client connected.
 5. Restart entity-resolution on the new database: set `mariadbOperator.primary: true` **and** `replicaCount: 1` in
    the same change, and let Argo CD sync. Do not set `primary: true` before step 4 is done: entity-resolution would
    start on an incomplete copy. Once switched, it connects with the `mariadbOperator.auth.username` user

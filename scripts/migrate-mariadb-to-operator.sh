@@ -231,16 +231,68 @@ preflight() {
   log "application user on the destination: ${app_user}"
 }
 
-# Client sessions open on a database pod, except our own (unix socket) and local sidecars (metrics exporter):
-# "id user@host db"
+# Client ports (one per line) of the connections the Bitnami metrics sidecar (mysqld-exporter, read-only) holds to
+# MariaDB: local ports of the TCP sockets to port 3306 owned by the processes of the "metrics" container of <pod>.
+# Nothing if the pod has no such container.
+exporter_ports() {
+  local pod="$1" containers
+  containers="$(kubectl -n "${namespace}" get pod "${pod}" -o jsonpath='{.spec.containers[*].name}')" || return 1
+  [[ " ${containers} " == *" metrics "* ]] || return 0
+  # shellcheck disable=SC2016
+  kubectl -n "${namespace}" exec "${pod}" -c metrics -- bash -c '
+    set -e
+    inodes=" "
+    for fd in /proc/[0-9]*/fd/*; do
+      l="$(readlink "${fd}" 2>/dev/null)" || continue
+      if [[ "${l}" == "socket:["*"]" ]]; then l="${l#socket:[}"; inodes+="${l%]} "; fi
+    done
+    for f in /proc/net/tcp /proc/net/tcp6; do
+      [[ -r "${f}" ]] || continue
+      { read -r _
+        while read -r _ local rem _ _ _ _ _ _ inode _; do
+          if [[ "${rem##*:}" == 0CEA && "${inodes}" == *" ${inode} "* ]]; then echo "$((16#${local##*:}))"; fi
+        done; } < "${f}"
+    done'
+}
+
+# Sessions open on a database pod, except this script's own connection and the connections of the metrics sidecar
+# (identified by their client port, see exporter_ports): "id user@host db". Any other session counts, including
+# root sessions over the unix socket or the loopback (e.g. a client opened with kubectl exec).
+open_sessions() {
+  local pod="$1" rows out ports id user host db
+  rows="$(sql "${pod}" "SELECT id, user, host, IFNULL(db, '-') FROM information_schema.processlist WHERE command NOT IN ('Daemon', 'Killed', 'Binlog Dump') AND id <> CONNECTION_ID()")" || return 1
+  [[ -n "${rows}" ]] || return 0
+  # Listed after the sessions: a connection the exporter opened in between is reported, never ignored
+  out="$(exporter_ports "${pod}")" || { log "cannot identify the connections of the metrics sidecar of ${pod}"; return 1; }
+  ports=" ${out//$'\n'/ } "
+  while IFS=$'\t' read -r id user host db; do
+    [[ -n "${id}" ]] || continue
+    if [[ "${host}" == *:* ]]; then
+      case "${host%:*}" in
+        localhost | 127.0.0.1 | ::1) [[ "${ports}" == *" ${host##*:} "* ]] && continue ;;
+      esac
+    fi
+    echo "${id} ${user}@${host} ${db}"
+  done <<< "${rows}"
+}
+
+# Client sessions of a database pod that stay open: present in two samples taken 2s apart (same id). Short-lived
+# sessions (exec probes of the container, a connection the exporter is opening) are not reported.
 client_sessions() {
-  sql "$1" "SELECT CONCAT(id, ' ', user, '@', host, ' ', IFNULL(db, '-')) FROM information_schema.processlist WHERE host NOT LIKE 'localhost%' AND host NOT LIKE '127.0.0.1%' AND command NOT IN ('Daemon', 'Killed', 'Binlog Dump') AND id <> CONNECTION_ID()"
+  local first second line
+  first="$(open_sessions "$1")" || return 1
+  [[ -n "${first}" ]] || return 0
+  sleep 2
+  second="$(open_sessions "$1")" || return 1
+  while read -r line; do
+    if [[ -n "${line}" ]] && grep -q "^${line%% *} " <<< "${first}"; then echo "${line}"; fi
+  done <<< "${second}"
 }
 
 # Fails if the application uses the destination: a session of its user, or any client on the database
 ensure_no_session_on_destination() {
   local sessions
-  sessions="$(sql "${dst_pod}" "SELECT CONCAT(id, ' ', user, '@', host, ' ', IFNULL(db, '-')) FROM information_schema.processlist WHERE (user = '${app_user}' OR db = '${database}') AND host NOT LIKE 'localhost%' AND command <> 'Killed' AND id <> CONNECTION_ID()")" \
+  sessions="$(sql "${dst_pod}" "SELECT CONCAT(id, ' ', user, '@', host, ' ', IFNULL(db, '-')) FROM information_schema.processlist WHERE (user = '${app_user}' OR db = '${database}') AND command <> 'Killed' AND id <> CONNECTION_ID()")" \
     || die "cannot list the sessions of ${dst_pod}"
   [[ -z "${sessions}" ]] || die "application sessions are open on ${dst_pod}, refusing to drop its database:"$'\n'"${sessions}"
 }
@@ -293,12 +345,16 @@ copy_data() {
   ensure_no_session_on_destination
   log "dropping and recreating database ${database} (${charset}/${collation}) on ${dst_pod}"
   sql "${dst_pod}" "DROP DATABASE IF EXISTS \`${database}\`; CREATE DATABASE \`${database}\` CHARACTER SET ${charset} COLLATE ${collation}"
-  log "streaming dump ${src_pod} -> ${dst_pod}"
+  # copy: consistent snapshot, entity-resolution keeps writing. migrate: global read lock held for the whole dump,
+  # so that no session (root included) can write to the source while it is read.
+  local consistency="--single-transaction"
+  [[ "${command}" == "migrate" ]] && consistency="--lock-all-tables"
+  log "streaming dump ${src_pod} -> ${dst_pod} (${consistency})"
   # shellcheck disable=SC2016
   kubectl -n "${namespace}" exec "${src_pod}" -c mariadb -- sh -c \
     "${remote_auth}"' exec "$(command -v mariadb-dump || command -v mysqldump)" -uroot \
-       --single-transaction --routines --triggers --events --hex-blob --default-character-set=utf8mb4 "$1"' \
-    sh "${database}" \
+       "$2" --routines --triggers --events --hex-blob --default-character-set=utf8mb4 "$1"' \
+    sh "${database}" "${consistency}" \
   | kubectl -n "${namespace}" exec -i "${dst_pod}" -c mariadb -- sh -c \
     "${remote_auth}"' exec "$(command -v mariadb || command -v mysql)" -uroot "$1"' sh "${database}"
   # Grants are not tied to the database: the ones the operator gave to its user survive the drop/recreate
