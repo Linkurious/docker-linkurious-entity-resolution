@@ -9,8 +9,13 @@
 # The dump is streamed from one pod to the other (kubectl exec | kubectl exec): no data is written locally.
 # Only the application database is copied: users and grants of the destination are managed by the operator.
 #
-# Usage: scripts/migrate-mariadb-to-operator.sh [-n namespace] [-r release] [-m mariadb] [-d database] [-y] <command>
-#   -m       name of the MariaDB resource (default: <release truncated to 52 chars>-mariadb-op, as in the chart)
+# Usage: scripts/migrate-mariadb-to-operator.sh [-n namespace] [-r release] [-s statefulset] [-b statefulset]
+#                                              [-m mariadb] [-d database] [-y] <command>
+#   -s       entity-resolution statefulset (default: the statefulset of the release, labeled
+#            app.kubernetes.io/instance=<release>, with a linkurious-entity-resolution container)
+#   -b       Bitnami MariaDB statefulset (default: the statefulset of the release with a mariadb container)
+#   -m       MariaDB resource of the mariadb-operator (default: derived from the entity-resolution statefulset, whose
+#            name is the chart fullname: <fullname truncated to 52 chars>-mariadb-op, as in the chart)
 #   check    show both databases (version, tables, row counts, users) and entity-resolution, changes nothing
 #   copy     rehearsal, entity-resolution keeps running on the Bitnami database: consistent snapshot, but writes
 #            made after it are not copied (row count differences are only reported)
@@ -29,15 +34,19 @@ namespace="linkurious-entity-resolution-preprod"
 release="linkurious-entity-resolution-develop"
 database="linkurious"
 assume_yes=false
+er_sts=""
+src_sts=""
 dst_name=""
 app_user=""
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
-while getopts "n:r:m:d:yh" opt; do
+while getopts "n:r:s:b:m:d:yh" opt; do
   case "${opt}" in
     n) namespace="${OPTARG}" ;;
     r) release="${OPTARG}" ;;
+    s) er_sts="${OPTARG}" ;;
+    b) src_sts="${OPTARG}" ;;
     m) dst_name="${OPTARG}" ;;
     d) database="${OPTARG}" ;;
     y) assume_yes=true ;;
@@ -48,16 +57,6 @@ shift $((OPTIND - 1))
 [[ $# -eq 1 ]] || usage
 command="$1"
 
-src_pod="${release}-mariadb-0"
-# Bitnami: the Service, the StatefulSet and the pod prefix are all "<fullname>-mariadb"
-src_service="${src_pod%-0}"
-if [[ -z "${dst_name}" ]]; then
-  # Same as linkurious-entity-resolution.mariadbOperator.fullname (fullname = release when it contains the chart name)
-  dst_name="${release:0:52}"
-  dst_name="${dst_name%%-}-mariadb-op"
-fi
-dst_pod="${dst_name}-0"
-er_sts="${release}"
 er_container="linkurious-entity-resolution"
 
 # Credentials never leave the pods: the root password is read from the container environment of each pod
@@ -67,6 +66,38 @@ remote_auth='set -e; export MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-$(cat "${MARIADB
 
 log() { echo "==> $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# --- resource names ---
+# They are read from the cluster rather than recomputed from the release name: the chart fullname is the release
+# name only when it contains the chart name, and nameOverride, fullnameOverride and mariadb.fullnameOverride change it.
+
+# release_sts <container> <option>: the only statefulset of the release (app.kubernetes.io/instance=<release>, set by
+# this chart and by the Bitnami chart) with a container named <container>. The mariadb-operator statefulset is labeled
+# with the MariaDB name instead, so it never matches.
+release_sts() {
+  local container="$1" option="$2" found
+  # shellcheck disable=SC2016
+  found="$(kubectl -n "${namespace}" get statefulsets -l "app.kubernetes.io/instance=${release}" -o go-template='{{range .items}}{{$n := .metadata.name}}{{range .spec.template.spec.containers}}{{if eq .name "'"${container}"'"}}{{$n}}{{"\n"}}{{end}}{{end}}{{end}}')" \
+    || die "cannot list the statefulsets of release ${release} in ${namespace}"
+  case "$(grep -c . <<< "${found}" || true)" in
+    1) echo "${found}" ;;
+    0) die "no statefulset of release ${release} (label app.kubernetes.io/instance=${release}) has a ${container} container in ${namespace}: check -n/-r, or set it with ${option}" ;;
+    *) die "several statefulsets of release ${release} have a ${container} container ($(tr '\n' ' ' <<< "${found}")): set it with ${option}" ;;
+  esac
+}
+
+[[ -n "${er_sts}" ]] || er_sts="$(release_sts "${er_container}" -s)"
+[[ -n "${src_sts}" ]] || src_sts="$(release_sts mariadb -b)"
+# Bitnami: the Service, the StatefulSet and the pod prefix are all "<fullname>-mariadb"
+src_pod="${src_sts}-0"
+src_service="${src_sts}"
+if [[ -z "${dst_name}" ]]; then
+  # The entity-resolution statefulset is named after the chart fullname: same as
+  # linkurious-entity-resolution.mariadbOperator.fullname (trunc 52 | trimSuffix "-", then "-mariadb-op")
+  dst_name="${er_sts:0:52}"
+  dst_name="${dst_name%-}-mariadb-op"
+fi
+dst_pod="${dst_name}-0"
 
 # sql <pod> <sql>: runs a statement as root in the mariadb container of the pod, prints tab separated rows
 sql() {
@@ -185,7 +216,7 @@ ensure_service_routes_to() {
 
 preflight() {
   log "context: $(kubectl config current-context), namespace: ${namespace}"
-  log "source: ${src_pod} (Bitnami), destination: ${dst_pod} (mariadb-operator), database: ${database}"
+  log "entity-resolution: statefulset ${er_sts}, source: ${src_pod} (Bitnami), destination: ${dst_pod} (mariadb-operator), database: ${database}"
   kubectl -n "${namespace}" get pod "${src_pod}" >/dev/null || die "source pod ${src_pod} not found"
   kubectl -n "${namespace}" wait --for=condition=Ready "mariadb/${dst_name}" --timeout=10s >/dev/null \
     || die "MariaDB ${dst_name} is not Ready (kubectl -n ${namespace} describe mariadb ${dst_name})"

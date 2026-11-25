@@ -44,6 +44,10 @@ until the new one is validated:
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop check
    scripts/migrate-mariadb-to-operator.sh -n linkurious-entity-resolution-preprod -r linkurious-entity-resolution-develop copy
    ```
+   The statefulsets are found from the release (label `app.kubernetes.io/instance=<release>`), and the MariaDB
+   name is derived from the entity-resolution statefulset (the chart fullname, so `nameOverride`/`fullnameOverride`
+   are taken into account). Set them explicitly with `-s` (entity-resolution statefulset), `-b` (Bitnami
+   statefulset) and `-m` (MariaDB resource) if needed.
 3. Stop entity-resolution: set `autoscaling.enabled: false` (if enabled) and `replicaCount: 0` in the same values
    change, then let Argo CD sync. Change the values in Git, not with `kubectl scale`: Argo CD (selfHeal) would revert
    it. Entity-resolution is unavailable from now on; restore autoscaling only after the cutover.
