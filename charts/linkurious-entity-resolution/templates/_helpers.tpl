@@ -53,9 +53,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{/*
 Name of the MariaDB run by the mariadb-operator (MariaDB resource, StatefulSet and Service).
 It differs from the Bitnami one ("<fullname>-mariadb") so that both can run side by side during the migration.
+The fullname is truncated to 43 characters: the operator derives other names from it that must fit in 63 characters,
+the longest being the Service "<name>-internal" (43 + 11 + 9 = 63) and, with metrics, the instance label
+"<name>-metrics" of the exporter selectors.
 */}}
 {{- define "linkurious-entity-resolution.mariadbOperator.fullname" -}}
-{{- printf "%s-mariadb-op" (include "linkurious-entity-resolution.fullname" . | trunc 52 | trimSuffix "-") }}
+{{- printf "%s-mariadb-op" (include "linkurious-entity-resolution.fullname" . | trunc 43 | trimSuffix "-") }}
 {{- end }}
 
 {{/*
