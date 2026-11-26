@@ -15,7 +15,7 @@
 #            app.kubernetes.io/instance=<release>, with a linkurious-entity-resolution container)
 #   -b       Bitnami MariaDB statefulset (default: the statefulset of the release with a mariadb container)
 #   -m       MariaDB resource of the mariadb-operator (default: derived from the entity-resolution statefulset, whose
-#            name is the chart fullname: <fullname truncated to 43 chars>-mariadb-op, as in the chart)
+#            name is the chart fullname: <fullname truncated to 41 chars>-mariadb-op, as in the chart)
 #   check    show both databases (version, tables, row counts, users) and entity-resolution, changes nothing
 #   copy     rehearsal, entity-resolution keeps running on the Bitnami database: consistent snapshot, but writes
 #            made after it are not copied (row count differences are only reported)
@@ -93,9 +93,9 @@ src_pod="${src_sts}-0"
 src_service="${src_sts}"
 if [[ -z "${dst_name}" ]]; then
   # The entity-resolution statefulset is named after the chart fullname: same as
-  # linkurious-entity-resolution.mariadbOperator.fullname (trunc 43 | trimSuffix "-", then "-mariadb-op"), so that
-  # the "<name>-internal" Service created by the operator fits in 63 characters
-  dst_name="${er_sts:0:43}"
+  # linkurious-entity-resolution.mariadbOperator.fullname (trunc 41 | trimSuffix "-", then "-mariadb-op"), so that
+  # the StatefulSet created by the operator is at most 52 characters (its controller-revision-hash label must fit in 63)
+  dst_name="${er_sts:0:41}"
   dst_name="${dst_name%-}-mariadb-op"
 fi
 dst_pod="${dst_name}-0"
