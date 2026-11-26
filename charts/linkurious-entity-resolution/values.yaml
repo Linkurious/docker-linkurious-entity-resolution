@@ -230,7 +230,7 @@ mariadbOperator:
   # -- Connect linkurious-entity-resolution to this database instead of the Bitnami one
   primary: false
   # -- MariaDB image. Keep the same version as the Bitnami MariaDB during the migration
-  image: docker.io/mariadb:11.4.6
+  image: docker.io/mariadb:11.4.7
   # -- Namespace of the mariadb-operator, allowed to connect to the database
   operatorNamespace: mariadb-operator
   auth:
